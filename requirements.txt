@@ -1,0 +1,1 @@
+﻿# 核心 Web 框架fastapiuvicorn[standard]streamlit# 財務數據抓取與處理yfinancepandaslxmlnumpy# 數據中台與連線supabasepython-dotenvrequestsurllib3
