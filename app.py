@@ -4,13 +4,13 @@ import yfinance as yf
 from supabase import create_client
 import os
 from datetime import datetime
+import time
 
 # --- 1. 初始化設定 ---
-st.set_page_config(page_title="富邦 D&O 數據採集站", layout="wide")
-st.title("📊 D&O 智能核保 - 數據採集終端")
+st.set_page_config(page_title="富邦 D&O 全台股採集中心", layout="wide", page_icon="📊")
+st.title("📊 D&O 智能核保 - 全台股自動化採集中心")
 
-# 讀取 Secrets (請確保 .streamlit/secrets.toml 或環境變數已設定)
-# 若在本地運行，也可直接將 URL/KEY 填入下方字串 (但不建議 commit 到 github)
+# 讀取 Supabase 設定
 SUPABASE_URL = os.getenv("SUPABASE_URL") or st.secrets.get("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY") or st.secrets.get("SUPABASE_KEY")
 
@@ -20,78 +20,104 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# --- 2. 輔助函數：日期轉民國季別 ---
+# --- 2. 核心功能：抓取 TWSE 上市總表 ---
+@st.cache_data(ttl=3600) # 快取 1 小時，避免重複爬網站
+def get_twse_listed_companies():
+    """從證交所網站抓取所有上市公司清單"""
+    url = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"
+    try:
+        # 台灣網站通常是 Big5 或 cp950 編碼
+        dfs = pd.read_html(url, encoding='cp950')
+        df = dfs[0]
+        
+        # 資料清理：證交所的表頭很亂，通常第 0 列是標題，我們要整理一下
+        # 設定欄位名稱
+        df.columns = df.iloc[0]
+        df = df.iloc[1:] # 移除第一列標題
+        
+        # 篩選出有「有價證券代號及名稱」的列
+        # 格式通常是 "2330　台積電" (中間全形空白)
+        df = df[df['有價證券代號及名稱'].notna()]
+        
+        # 拆分 代號 與 名稱
+        # 有些列是分類標題 (如 "股票"), 只有代號名稱列會有全形空白
+        df_stock = df[df['有價證券代號及名稱'].str.contains('　')]
+        
+        # 分割字串
+        df_stock[['代號', '名稱']] = df_stock['有價證券代號及名稱'].str.split('　', expand=True).iloc[:, :2]
+        
+        # 只保留需要的欄位
+        clean_df = df_stock[['代號', '名稱', '產業別', '上市日', '市場別']]
+        
+        # 只要 "股票" 類別 (排除權證等)
+        # 上市公司的代號通常是 4 碼數字
+        clean_df = clean_df[clean_df['代號'].str.match(r'^\d{4}$')]
+        
+        return clean_df
+    except Exception as e:
+        st.error(f"無法讀取證交所清單: {e}")
+        return pd.DataFrame()
+
+# --- 3. 輔助函數：日期轉民國季別 ---
 def date_to_roc_quarter(date_obj):
-    """將 datetime 物件轉為 '114年 Q3' 格式"""
     year_roc = date_obj.year - 1911
     quarter = (date_obj.month - 1) // 3 + 1
     return f"{year_roc}年 Q{quarter}"
 
-# --- 3. 核心爬蟲邏輯 (yfinance 版) ---
-def fetch_and_upload_data(stock_code):
-    status_text = st.empty()
-    status_text.info(f"🔍 正在連線 Yahoo Finance 抓取 {stock_code}...")
-    
-    # 處理台股代號 (加上 .TW)
-    ticker_symbol = f"{stock_code}.TW" if not stock_code.endswith(".TW") else stock_code
+# --- 4. 核心爬蟲邏輯 (Fetch Logic) ---
+def fetch_and_upload_data(stock_code, stock_name_tw=None):
+    """
+    抓取單一股票數據並上傳
+    stock_name_tw: 如果有提供中文名就用，沒有就讓 yfinance 抓
+    """
+    ticker_symbol = f"{stock_code}.TW"
     stock = yf.Ticker(ticker_symbol)
     
     try:
-        # A. 抓取三大報表 (Quarterly)
-        # yfinance 的 quarterly_xxx 通常預設回傳近 4-5 季，我們盡量抓取
-        bs = stock.quarterly_balance_sheet  # 資產負債表
-        is_ = stock.quarterly_financials    # 損益表
-        cf = stock.quarterly_cashflow       # 現金流量表 (關鍵!)
-
+        # 抓取報表
+        bs = stock.quarterly_balance_sheet
+        is_ = stock.quarterly_financials
+        cf = stock.quarterly_cashflow
+        
+        # 若是完全空值 (可能下市或代號錯)
         if bs.empty or is_.empty:
-            st.error(f"❌ 找不到 {stock_code} 的財務數據，請確認代號是否正確。")
-            return
+            return False, "無財務數據 (可能無權限或代號錯誤)"
 
-        # B. 合併報表 (以日期為 Index)
-        # 轉置(T)讓日期變 Index，方便 concat
+        # 合併報表
         df_merged = pd.concat([is_.T, bs.T, cf.T], axis=1)
-        
-        # 移除重複欄位 (有些項目名稱可能重複)
         df_merged = df_merged.loc[:, ~df_merged.columns.duplicated()]
+        df_merged.index = pd.to_datetime(df_merged.index)
         
-        # C. 篩選與改名 (Mapping)
-        # 定義我們要抓的項目 (英文 -> 中文)
-        # 註：yfinance 的欄位名稱可能會隨版本變動，這裡列出常見名稱
+        # 抓近 12 季 (3年) 確保有完整年度資料
+        df_sorted = df_merged.sort_index(ascending=False).head(12)
+        
+        # 欄位對照
         mapping = {
             "Total Revenue": "營業收入",
-            "Operating Revenue": "營業收入", # 備用
+            "Operating Revenue": "營業收入",
             "Total Assets": "總資產",
-            "Total Liabilities Net Minority Interest": "總負債", # 用於計算負債比
-            "Total Liabilities": "總負債", # 備用
+            "Total Liabilities Net Minority Interest": "總負債",
+            "Total Liabilities": "總負債",
             "Current Assets": "流動資產",
             "Current Liabilities": "流動負債",
             "Basic EPS": "每股盈餘(EPS)",
-            "Operating Cash Flow": "營業活動淨現金流", # 🔥 關鍵新增
             "Operating Cash Flow": "營業活動淨現金流"
         }
         
-        # 準備打包的資料結構
-        # 為了要讓 API 能算出 YoY，我們嘗試取最近 8 個時間點 (如果有的話)
-        # sort_index(ascending=False) 確保最新的在前面
-        df_merged.index = pd.to_datetime(df_merged.index)
-        df_sorted = df_merged.sort_index(ascending=False).head(8) # 抓近 8 季
-        
-        # 建立目標項目清單
         target_items = [
             "營業收入", "總資產", "負債比", 
             "流動資產", "流動負債", "每股盈餘(EPS)", 
             "營業活動淨現金流"
         ]
         
-        formatted_data = [] # 準備存成 List[Dict]
+        formatted_data = []
 
         for target_name in target_items:
             row_dict = {"項目": target_name}
-            
             for date_idx in df_sorted.index:
-                key_name = date_to_roc_quarter(date_idx) # 轉成 "114年 Q3"
+                key_name = date_to_roc_quarter(date_idx)
                 
-                # 1. 負債比特殊計算
+                # 負債比計算
                 if target_name == "負債比":
                     try:
                         liab = df_sorted.loc[date_idx].get("Total Liabilities Net Minority Interest") or df_sorted.loc[date_idx].get("Total Liabilities")
@@ -101,91 +127,158 @@ def fetch_and_upload_data(stock_code):
                             row_dict[key_name] = f"{val:.2f}%"
                         else:
                             row_dict[key_name] = "-"
-                    except:
-                        row_dict[key_name] = "-"
-                        
-                # 2. 其他一般項目
+                    except: row_dict[key_name] = "-"
+                
+                # 一般項目
                 else:
-                    # 找對應的英文欄位
                     found_val = None
                     for eng_col, ch_col in mapping.items():
                         if ch_col == target_name:
                             if eng_col in df_sorted.columns:
                                 val = df_sorted.loc[date_idx, eng_col]
-                                # 檢查是否為 NaN
                                 if pd.notna(val):
                                     found_val = val
                                     break
                     
                     if found_val is not None:
-                        # 單位換算：除了 EPS 和百分比，其他轉為「千元」
                         if target_name != "每股盈餘(EPS)":
-                            # 原始數據通常是元，除以 1000
-                            val_thousands = int(found_val / 1000)
-                            # 格式化加上逗號
-                            row_dict[key_name] = f"{val_thousands:,}"
+                            # 單位換算：元 -> 千元
+                            row_dict[key_name] = f"{int(found_val / 1000):,}"
                         else:
-                            # EPS 保持原樣
                             row_dict[key_name] = f"{found_val:.2f}"
                     else:
                         row_dict[key_name] = "-"
             
             formatted_data.append(row_dict)
 
-        # D. 上傳 Supabase
-        stock_name = stock.info.get('longName', stock_code) # 嘗試抓中文名
-        
+        # 上傳 Supabase
+        # 如果使用者沒提供中文名，嘗試從 yfinance 抓 (通常是英文)
+        final_name = stock_name_tw if stock_name_tw else stock.info.get('longName', stock_code)
+
         payload = {
             "code": stock_code,
-            "name": stock_name,
+            "name": final_name,
             "financial_data": formatted_data,
             "updated_at": datetime.now().isoformat()
         }
         
-        # Upsert (有則更新，無則新增)
-        data, count = supabase.table("underwriting_cache").upsert(payload).execute()
-        
-        status_text.success(f"✅ 成功！{stock_code} ({stock_name}) 數據已同步至中台。")
-        st.json(formatted_data) # 顯示預覽
+        supabase.table("underwriting_cache").upsert(payload).execute()
+        return True, f"成功同步: {final_name}"
 
     except Exception as e:
-        st.error(f"❌ 發生錯誤: {str(e)}")
-        # 顯示詳細錯誤以便除錯
-        import traceback
-        st.text(traceback.format_exc())
+        return False, str(e)
 
-# --- 4. Streamlit UI 介面 ---
-col1, col2 = st.columns([1, 2])
-
-with col1:
-    st.markdown("### 📥 數據同步中心")
-    stock_input = st.text_input("輸入股票代號", value="2330", help="例如 2330, 2881")
-    
-    if st.button("🚀 執行採集 / 更新數據", type="primary"):
-        if stock_input:
-            fetch_and_upload_data(stock_input)
-        else:
-            st.warning("請輸入代號")
-
-    st.markdown("---")
-    st.markdown("""
-    **功能說明：**
-    * 來源：Yahoo Finance (即時)
-    * 範圍：嘗試抓取近 8 季數據
-    * 項目：包含現金流、營收、負債比
-    * 單位：自動換算為「千元」
-    """)
-
-with col2:
-    st.markdown("### 💾 中台數據預覽 (Supabase)")
-    # 簡單的查詢功能查看目前 DB 狀況
-    if st.button("🔄 重新整理資料庫列表"):
+# --- 5. Streamlit UI 介面 ---
+# 側邊欄：資料庫狀態
+with st.sidebar:
+    st.header("💾 資料庫狀態")
+    if st.button("🔄 刷新資料庫列表"):
         try:
-            res = supabase.table("underwriting_cache").select("code, name, updated_at").order("updated_at", desc=True).limit(10).execute()
+            res = supabase.table("underwriting_cache").select("code, name, updated_at", count="exact").execute()
+            st.metric("已建檔公司數", res.count)
             if res.data:
                 df_db = pd.DataFrame(res.data)
-                st.dataframe(df_db, use_container_width=True)
-            else:
-                st.info("目前資料庫為空")
+                df_db['updated_at'] = pd.to_datetime(df_db['updated_at']).dt.strftime('%Y-%m-%d %H:%M')
+                st.dataframe(df_db, hide_index=True)
         except Exception as e:
-            st.error(f"讀取失敗: {e}")
+            st.error(f"連線失敗: {e}")
+
+# 主畫面
+tab1, tab2 = st.tabs(["🚀 上市公司總表 (批量)", "🔍 手動單筆查詢"])
+
+# --- Tab 1: TWSE 總表模式 (新功能) ---
+with tab1:
+    st.markdown("### 🏢 台灣證券交易所 (TWSE) 上市公司總表")
+    st.info("資料來源：https://isin.twse.com.tw/isin/C_public.jsp?strMode=2")
+    
+    # 載入按鈕
+    if 'twse_df' not in st.session_state:
+        st.session_state.twse_df = None
+
+    if st.button("📥 載入/刷新 上市公司清單"):
+        with st.spinner("正在連線證交所抓取最新清單..."):
+            df = get_twse_listed_companies()
+            if not df.empty:
+                st.session_state.twse_df = df
+                st.success(f"成功載入 {len(df)} 家上市公司！")
+    
+    # 如果已經載入清單，顯示操作介面
+    if st.session_state.twse_df is not None:
+        df = st.session_state.twse_df
+        
+        # 1. 篩選器
+        col_filter1, col_filter2 = st.columns(2)
+        with col_filter1:
+            all_industries = ["全部"] + list(df['產業別'].unique())
+            selected_industry = st.selectbox("📂 篩選產業別", all_industries)
+        
+        with col_filter2:
+            search_keyword = st.text_input("🔍 搜尋公司名稱/代號", "")
+
+        # 套用篩選
+        filtered_df = df.copy()
+        if selected_industry != "全部":
+            filtered_df = filtered_df[filtered_df['產業別'] == selected_industry]
+        if search_keyword:
+            filtered_df = filtered_df[filtered_df['代號'].str.contains(search_keyword) | filtered_df['名稱'].str.contains(search_keyword)]
+
+        # 2. 顯示表格 (可勾選)
+        st.write(f"顯示 {len(filtered_df)} 筆資料 (請勾選要更新的公司):")
+        
+        # 使用 data_editor 讓使用者可以勾選
+        filtered_df['選取'] = False # 新增一欄勾選框
+        # 將 '選取' 欄移到最前面
+        cols = ['選取'] + [c for c in filtered_df.columns if c != '選取']
+        edited_df = st.data_editor(
+            filtered_df[cols], 
+            hide_index=True, 
+            column_config={"選取": st.column_config.CheckboxColumn(required=True)},
+            disabled=["代號", "名稱", "產業別", "上市日", "市場別"]
+        )
+
+        # 3. 批量執行按鈕
+        selected_rows = edited_df[edited_df['選取'] == True]
+        
+        if not selected_rows.empty:
+            st.warning(f"⚠️ 即將更新 {len(selected_rows)} 家公司的財務數據。大量更新可能需耗時數分鐘。")
+            
+            if st.button("🚀 開始批量更新 (Batch Update)", type="primary"):
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                log_area = st.expander("詳細執行紀錄", expanded=True)
+                
+                total = len(selected_rows)
+                success_count = 0
+                
+                for i, row in enumerate(selected_rows.itertuples()):
+                    code = row.代號
+                    name = row.名稱
+                    
+                    status_text.text(f"⏳ ({i+1}/{total}) 正在處理: {code} {name} ...")
+                    
+                    # 執行爬蟲
+                    success, msg = fetch_and_upload_data(code, name)
+                    
+                    if success:
+                        success_count += 1
+                        log_area.write(f"✅ {code} {name}: 成功")
+                    else:
+                        log_area.write(f"❌ {code} {name}: {msg}")
+                    
+                    progress_bar.progress((i + 1) / total)
+                    time.sleep(1) # 稍微暫停避免被 Yahoo 封鎖
+                
+                status_text.success(f"🎉 任務完成！成功更新 {success_count}/{total} 家公司。")
+                st.balloons()
+
+# --- Tab 2: 單筆模式 (舊功能保留) ---
+with tab2:
+    st.markdown("### 📝 手動輸入代號")
+    stock_input = st.text_input("輸入股票代號", value="2330", help="例如 2330")
+    if st.button("執行單筆採集", type="primary"):
+        if stock_input:
+            success, msg = fetch_and_upload_data(stock_input)
+            if success:
+                st.success(msg)
+            else:
+                st.error(msg)
