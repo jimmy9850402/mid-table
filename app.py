@@ -194,7 +194,7 @@ with st.sidebar:
 # 主畫面 Tab
 tab1, tab2 = st.tabs(["🚀 上市公司總表 (批量)", "🔍 手動單筆查詢"])
 
-# --- Tab 1: 批量管理模式 ---
+# --- Tab 1: 批量管理模式 (新增全選功能) ---
 with tab1:
     st.markdown("### 🏢 批量採集管理")
     
@@ -250,18 +250,42 @@ with tab1:
         if search_keyword:
             filtered_df = filtered_df[filtered_df['代號'].str.contains(search_keyword) | filtered_df['名稱'].str.contains(search_keyword)]
 
-        # 2. 顯示可勾選表格
+        # 2. 顯示表格 (含全選功能)
         st.write(f"顯示 {len(filtered_df)} 筆資料 (請勾選要更新的公司):")
         
-        filtered_df['選取'] = False
+        # --- 全選/取消全選 按鈕區 ---
+        col_btn1, col_btn2, col_space = st.columns([1, 1, 6])
+        
+        # 初始化 Session State 來控制表格刷新
+        if 'editor_key' not in st.session_state:
+            st.session_state.editor_key = 0
+        if 'default_selection' not in st.session_state:
+            st.session_state.default_selection = False
+
+        # 按鈕邏輯：點擊後更改預設狀態並刷新 key
+        if col_btn1.button("✅ 全選"):
+            st.session_state.default_selection = True
+            st.session_state.editor_key += 1 # 強制刷新表格
+            st.rerun()
+            
+        if col_btn2.button("❌ 取消全選"):
+            st.session_state.default_selection = False
+            st.session_state.editor_key += 1 # 強制刷新表格
+            st.rerun()
+
+        # 設定選取欄位的預設值
+        filtered_df['選取'] = st.session_state.default_selection
+        
         cols = ['選取'] + [c for c in filtered_df.columns if c != '選取']
         
+        # 顯示 Data Editor (加入 key 參數以支援刷新)
         edited_df = st.data_editor(
             filtered_df[cols], 
             hide_index=True, 
             column_config={"選取": st.column_config.CheckboxColumn(required=True)},
             disabled=["代號", "名稱", "產業別", "上市日", "市場別"],
-            height=400
+            height=400,
+            key=f"editor_{st.session_state.editor_key}" # 動態 Key
         )
 
         # 3. 批量執行按鈕
