@@ -5,7 +5,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from supabase import create_client
 
-app = FastAPI(title="Fubon D&O API - Hybrid Report")
+app = FastAPI(title="Fubon D&O API - Smart Clean Report")
 
 # --- 1. 初始化與連線 ---
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -25,7 +25,7 @@ async def analyze(request: Request):
         body = await request.json()
         query = str(body.get("company", "")).strip()
         
-        # --- 2. 搜尋邏輯 (代號/名稱) ---
+        # --- 2. 搜尋邏輯 ---
         if not query:
              return JSONResponse({"error": "Input Empty", "markdown_table": "❌ 未收到輸入值"}, status_code=200)
 
@@ -50,41 +50,54 @@ async def analyze(request: Request):
             return JSONResponse({"markdown_table": "❌ 數據異常"}, status_code=200)
 
         # ==========================================
-        # 🔥 核心邏輯：混合顯示 (最新 5 季 + 近 2 年)
+        # 🔥 核心邏輯：過濾空季度 (Smart Filter)
         # ==========================================
         
-        # 1. 處理季度 (Quarters) - 取最新的 5 季
+        # 1. 取得所有含 Q 的季度 Key
         all_keys = [k for k in raw_rows[0].keys() if k != "項目"]
-        # 篩選出含 "Q" 的 Key，並由新到舊排序 (例如 114年 Q3, 114年 Q2...)
-        sorted_quarters = sorted([k for k in all_keys if "Q" in k], reverse=True)
-        display_quarters = sorted_quarters[:5] # 只拿前 5 個
+        all_quarters = sorted([k for k in all_keys if "Q" in k], reverse=True)
         
-        # 2. 處理年度 (Years) - 指定 2023(112) 與 2024(113)
-        target_years_roc = [112, 113] # 民國年
-        display_years_labels = ["2023年", "2024年"] # 表頭顯示名稱
+        # 2. 【過濾邏輯】找出「營業收入」不是空值的季度
+        # 先找到營收那一列
+        rev_row = next((r for r in raw_rows if "營業收入" in r["項目"]), None)
         
-        # 輔助函數：找年度數據 (找不到找 Q4 替代)
+        valid_quarters = []
+        if rev_row:
+            for q in all_quarters:
+                val = str(rev_row.get(q, "-"))
+                # 如果營收不是 -, 0, N/A, nan，才算有效季度
+                if val not in ["-", "0", "N/A", "None", "nan"]:
+                    valid_quarters.append(q)
+        else:
+            # 萬一沒抓到營收列，就只好全顯 (避免報錯)
+            valid_quarters = all_quarters
+
+        # 3. 只取「有效季度」的前 5 個
+        display_quarters = valid_quarters[:5]
+        
+        # ------------------------------------------
+        
+        # 4. 處理年度 (Years) - 指定 2023(112) 與 2024(113)
+        target_years_roc = [112, 113]
+        display_years_labels = ["2023年", "2024年"]
+        
         def get_year_val(roc_year, row):
             key_full = f"{roc_year}年"
             key_q4 = f"{roc_year}年 Q4"
-            
-            # A. 優先找整年數據 (且不是空值)
             if key_full in row and str(row[key_full]) not in ["-", "None", "0"]:
                 return str(row[key_full])
-            # B. 其次找 Q4 暫代，並標註
             elif key_q4 in row:
                 return str(row[key_q4]) + " (Q4)"
             else:
                 return "-"
 
-        # 3. 組合表頭 (季度在前，年度在後)
-        # 最終欄位 = [項目] + [Q1] [Q2] [Q3] [Q4] [Q5] + [2023] [2024]
+        # 5. 組合表頭
         all_headers = display_quarters + display_years_labels
         
         header_str = "| 項目 | " + " | ".join(all_headers) + " |"
         sep_str = "| :--- | " + " | ".join([":---"] * len(all_headers)) + " |"
         
-        # 4. 定義顯示項目 (對應 Streamlit 抓取的內容)
+        # 6. 定義顯示項目
         target_items = [
             "營業收入", "總資產", "負債比", 
             "流動資產", "流動負債", 
@@ -94,18 +107,17 @@ async def analyze(request: Request):
 
         md_rows = []
 
-        # 5. 填入數據
+        # 7. 填入數據
         for item_name in target_items:
-            # 在 JSON 中找到對應的項目列
             row_data = next((r for r in raw_rows if item_name in r["項目"]), None)
             vals = []
             
             if row_data:
-                # A. 填入 5 季數據
+                # A. 填入有效季度
                 for q in display_quarters:
                     vals.append(str(row_data.get(q, "-")))
                 
-                # B. 填入 2 年數據
+                # B. 填入年度
                 for yr in target_years_roc:
                     vals.append(get_year_val(yr, row_data))
             else:
@@ -120,14 +132,12 @@ async def analyze(request: Request):
         # ==========================================
         conclusion = "⚠️ 無法判定"
         try:
-            rev_row = next((r for r in raw_rows if "營業收入" in r["項目"]), None)
             if rev_row and display_quarters:
-                # 抓取「最新一季」的營收來判斷
+                # 抓取「有效最新季」的營收來判斷
                 latest_q = display_quarters[0]
-                val_str = str(rev_row.get(latest_q, "0")).replace(",", "").split(" ")[0] # 移除 (Q4) 等註記
+                val_str = str(rev_row.get(latest_q, "0")).replace(",", "").split(" ")[0]
                 val = float(val_str)
                 
-                # 門檻：150億 (單位為千元 -> 15,000,000)
                 if val > 15000000:
                     conclusion = "⚠️ **本案不符合 Group A** (營收 > 150億，屬大型企業)"
                 else:
