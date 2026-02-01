@@ -1,12 +1,13 @@
 import os
 import json
+import re
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from supabase import create_client
 
-app = FastAPI(title="Fubon D&O API - Middleware Distributor")
+app = FastAPI(title="Fubon D&O API - Smart Report")
 
-# 1. 安全連線
+# --- 1. 初始化與連線 ---
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
@@ -24,74 +25,110 @@ async def analyze(request: Request):
         body = await request.json()
         query = str(body.get("company", "")).strip()
         
-        # --- 🔥 MA 核心升級：雙軌搜尋邏輯 ---
+        # --- 雙軌搜尋 (代碼/名稱) ---
         if not query:
-             return JSONResponse({
-                "error": "Input Empty",
-                "markdown_table": "❌ 系統未收到輸入值。請確認 Copilot 是否正確傳遞了 `System.LastMessage.Text`。"
-            }, status_code=200)
+             return JSONResponse({"error": "Input Empty", "markdown_table": "❌ 未收到輸入值"}, status_code=200)
 
         stock_id = "".join(filter(str.isdigit, query))
         res = None
-
         if stock_id:
-            # Case A: 使用者輸入代碼 (如 "2881") -> 查 code 欄位
             res = supabase.table("underwriting_cache").select("*").eq("code", stock_id).execute()
         else:
-            # Case B: 使用者輸入中文 (如 "富邦金") -> 查 name 欄位 (模糊搜尋)
             res = supabase.table("underwriting_cache").select("*").ilike("name", f"%{query}%").execute()
-            
-        # ----------------------------------------
 
-        # 檢查是否在中台找到資料
         if not res or not res.data:
-            search_key = stock_id if stock_id else query
             return JSONResponse({
-                "error": "Not Found",
-                "markdown_table": f"⚠️ 中台尚未採集到 **{search_key}** 的數據。\n\n請先至 Streamlit 採集端執行同步任務。",
-                "conclusion": "無法判定 (缺數據)"
+                "error": "Not Found", 
+                "markdown_table": f"⚠️ 中台無 **{query}** 數據，請先採集。",
+                "conclusion": "缺數據"
             }, status_code=200)
 
-        # 取得資料記錄
         record = res.data[0]
-        table_rows = record.get('financial_data', [])
+        raw_rows = record.get('financial_data', [])
+
+        # ==========================================
+        # 🔥 MA 客製化邏輯：固定四欄位報表引擎
+        # ==========================================
         
-        # --- Markdown 表格生成 (保持不變) ---
-        first_row_keys = list(table_rows[0].keys())
-        quarters = sorted([k for k in first_row_keys if k != "項目"], reverse=True)
+        # 1. 定義目標列 (您指定的6個項目)
+        target_items = [
+            "營業收入", "總資產", "負債比", 
+            "流動資產", "流動負債", "營業活動淨現金流"
+        ]
+
+        # 2. 智慧鎖定時間欄位
+        # 先找出所有可用的時間 Key (排除 '項目')
+        if not raw_rows: 
+            return JSONResponse({"markdown_table": "❌ 數據異常"}, status_code=200)
+            
+        all_keys = [k for k in raw_rows[0].keys() if k != "項目"]
+        # 排序找出最新季 (例如 '114年 Q3')
+        sorted_keys = sorted([k for k in all_keys if "Q" in k], reverse=True)
+        latest_q = sorted_keys[0] if sorted_keys else "N/A"
         
-        md_header = "| 項目 | " + " | ".join(quarters) + " |"
-        md_separator = "| :--- | " + " | ".join([":---"] * len(quarters)) + " |"
+        # 計算去年同期 (YoY)
+        last_year_same_q = "N/A"
+        match = re.match(r"(\d+)年 (Q\d)", latest_q)
+        if match:
+            roc_year = int(match.group(1))
+            q_part = match.group(2)
+            last_year_same_q = f"{roc_year - 1}年 {q_part}"
+
+        # 定義顯示欄位對照表 (Display Name -> Data Key)
+        # 註：2023年 = 民國112年; 2024年 = 民國113年
+        col_mapping = [
+            ("最新季", latest_q),
+            ("去年同期", last_year_same_q),
+            ("2023 年", "112年"),
+            ("2024 年", "113年")  # 注意：若年報未出，此欄可能為空或需抓累計
+        ]
+
+        # 3. 建構 Markdown 表格
+        # 表頭
+        md_header = "| 項目 | " + " | ".join([c[0] for c in col_mapping]) + " |"
+        md_sep = "| :--- | " + " | ".join([":---"] * len(col_mapping)) + " |"
         
         md_rows = []
-        for row in table_rows:
-            values = [str(row.get(q, "-")) for q in quarters]
-            line = f"| **{row.get('項目', '未知')}** | " + " | ".join(values) + " |"
-            md_rows.append(line)
+        
+        # 遍歷目標項目，依序抓取數據
+        for item_name in target_items:
+            # 在原始數據中找到這一列 (若找不到則建立假資料避免報錯)
+            row_data = next((r for r in raw_rows if r["項目"] == item_name), None)
             
-        final_markdown = f"{md_header}\n{md_separator}\n" + "\n".join(md_rows)
-
-        # --- 核保判定邏輯 (保持不變) ---
-        rev_row = next((item for item in table_rows if item["項目"] == "營業收入"), None)
-        conclusion = "⚠️ 無法自動判定"
-        if rev_row and quarters:
-            try:
-                latest_rev = float(str(rev_row.get(quarters[0], "0")).replace(",", ""))
-                if latest_rev >= 15000000:
-                    conclusion = "✅ **符合 Group A 核決授權門檻** (營收 > 150億)"
+            vals = []
+            for _, data_key in col_mapping:
+                if row_data:
+                    # 嘗試抓取，若無數據則顯示 "-"
+                    val = str(row_data.get(data_key, "-"))
                 else:
-                    conclusion = "⚠️ **營收未達 Group A 門檻**，建議由總公司核決。"
-            except: pass
+                    val = "N/A" # 該公司完全沒有這個會計項目 (如現金流)
+                vals.append(val)
+            
+            md_rows.append(f"| **{item_name}** | " + " | ".join(vals) + " |")
+
+        final_markdown = f"{md_header}\n{md_sep}\n" + "\n".join(md_rows)
+        # ==========================================
+
+        # --- 核保判定 (維持 Group A 150億門檻) ---
+        conclusion = "⚠️ 無法判定"
+        try:
+            # 抓取最新季營收進行判斷
+            rev_row = next((r for r in raw_rows if r["項目"] == "營業收入"), None)
+            if rev_row:
+                val_str = str(rev_row.get(latest_q, "0")).replace(",", "")
+                # 門檻 150億 (單位千元 -> 15,000,000)
+                if float(val_str) > 15000000:
+                    conclusion = "⚠️ **本案不符合 Group A** (營收 > 150億，屬大型企業)"
+                else:
+                    conclusion = "✅ **符合 Group A** (營收 < 150億，屬中小型良質業務)"
+        except: pass
 
         return {
-            "header": f"【D&O 核保分析 - {record.get('name')} ({record.get('code')})】",
+            "header": f"【D&O 財報分析 - {record.get('name')}】",
             "markdown_table": final_markdown,
             "conclusion": conclusion,
             "status": "success"
         }
 
     except Exception as e:
-        return JSONResponse({
-            "error": str(e),
-            "markdown_table": f"❌ 處理異常: {str(e)}"
-        }, status_code=200)
+        return JSONResponse({"error": str(e), "markdown_table": "❌ 系統處理錯誤"}, status_code=200)
