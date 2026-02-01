@@ -9,7 +9,7 @@ import requests
 import ssl
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 
-# 忽略 SSL 警告
+# 忽略 SSL 警告 (為了解決證交所憑證問題)
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 # --- 1. 初始化設定 ---
@@ -70,7 +70,7 @@ def date_to_roc_quarter(date_obj):
     quarter = (date_obj.month - 1) // 3 + 1
     return f"{year_roc}年 Q{quarter}"
 
-# --- 4. 核心爬蟲邏輯 (yfinance + Cash Flow) ---
+# --- 4. 核心爬蟲邏輯 (增強版 Mapping) ---
 def fetch_and_upload_data(stock_code, stock_name_tw=None):
     """
     抓取單一股票數據並上傳
@@ -82,7 +82,7 @@ def fetch_and_upload_data(stock_code, stock_name_tw=None):
         # A. 抓取三大報表 (Quarterly)
         bs = stock.quarterly_balance_sheet
         is_ = stock.quarterly_financials
-        cf = stock.quarterly_cashflow # 🔥 務必抓取現金流
+        cf = stock.quarterly_cashflow 
         
         if bs.empty or is_.empty:
             return False, "無財務數據 (可能無權限或代號錯誤)"
@@ -97,17 +97,26 @@ def fetch_and_upload_data(stock_code, stock_name_tw=None):
         df_sorted = df_merged.sort_index(ascending=False).head(12)
         
         # D. 欄位對照 Mapping (Yahoo Finance -> 中文)
+        # 🔥 針對現金流問題，增加多種備用欄位名稱 (Aliases)
         mapping = {
+            # --- 損益表 ---
             "Total Revenue": "營業收入",
             "Operating Revenue": "營業收入",
+            
+            # --- 資產負債表 ---
             "Total Assets": "總資產",
             "Total Liabilities Net Minority Interest": "總負債",
             "Total Liabilities": "總負債",
             "Current Assets": "流動資產",
             "Current Liabilities": "流動負債",
+            
+            # --- 核心數據 ---
             "Basic EPS": "每股盈餘(EPS)",
-            "Operating Cash Flow": "營業活動淨現金流", # 🔥 關鍵欄位
-            "Operating Cash Flow": "營業活動淨現金流"
+            
+            # --- 🔥 現金流量表 (增強對照) ---
+            "Operating Cash Flow": "營業活動淨現金流",
+            "Total Cash From Operating Activities": "營業活動淨現金流", # yfinance 常見別名
+            "Cash Flow From Continuing Operating Activities": "營業活動淨現金流" # 另一種可能
         }
         
         target_items = [
@@ -151,7 +160,10 @@ def fetch_and_upload_data(stock_code, stock_name_tw=None):
                     if found_val is not None:
                         # 單位換算：除了 EPS，其他轉為「千元」
                         if target_name != "每股盈餘(EPS)":
-                            row_dict[key_name] = f"{int(found_val / 1000):,}"
+                            try:
+                                row_dict[key_name] = f"{int(found_val / 1000):,}"
+                            except:
+                                row_dict[key_name] = "-"
                         else:
                             row_dict[key_name] = f"{found_val:.2f}"
                     else:
@@ -185,7 +197,6 @@ with st.sidebar:
             st.metric("已建檔公司數", res.count)
             if res.data:
                 df_db = pd.DataFrame(res.data)
-                # 簡單格式化時間
                 df_db['updated_at'] = pd.to_datetime(df_db['updated_at']).dt.strftime('%Y-%m-%d %H:%M')
                 st.dataframe(df_db, hide_index=True)
         except Exception as e:
@@ -194,7 +205,7 @@ with st.sidebar:
 # 主畫面 Tab
 tab1, tab2 = st.tabs(["🚀 上市公司總表 (批量)", "🔍 手動單筆查詢"])
 
-# --- Tab 1: 批量管理模式 (新增全選功能) ---
+# --- Tab 1: 批量管理模式 (含全選功能) ---
 with tab1:
     st.markdown("### 🏢 批量採集管理")
     
@@ -262,15 +273,15 @@ with tab1:
         if 'default_selection' not in st.session_state:
             st.session_state.default_selection = False
 
-        # 按鈕邏輯：點擊後更改預設狀態並刷新 key
-        if col_btn1.button("✅ 全選"):
+        # 按鈕邏輯
+        if col_btn1.button("✅ 全選 (Select All)"):
             st.session_state.default_selection = True
-            st.session_state.editor_key += 1 # 強制刷新表格
+            st.session_state.editor_key += 1
             st.rerun()
             
-        if col_btn2.button("❌ 取消全選"):
+        if col_btn2.button("❌ 取消全選 (Deselect All)"):
             st.session_state.default_selection = False
-            st.session_state.editor_key += 1 # 強制刷新表格
+            st.session_state.editor_key += 1
             st.rerun()
 
         # 設定選取欄位的預設值
@@ -278,21 +289,21 @@ with tab1:
         
         cols = ['選取'] + [c for c in filtered_df.columns if c != '選取']
         
-        # 顯示 Data Editor (加入 key 參數以支援刷新)
+        # 顯示 Data Editor
         edited_df = st.data_editor(
             filtered_df[cols], 
             hide_index=True, 
             column_config={"選取": st.column_config.CheckboxColumn(required=True)},
             disabled=["代號", "名稱", "產業別", "上市日", "市場別"],
             height=400,
-            key=f"editor_{st.session_state.editor_key}" # 動態 Key
+            key=f"editor_{st.session_state.editor_key}" # 動態 Key 以強制刷新
         )
 
         # 3. 批量執行按鈕
         selected_rows = edited_df[edited_df['選取'] == True]
         
         if not selected_rows.empty:
-            st.warning(f"⚠️ 即將更新 {len(selected_rows)} 家公司的財務數據。大量更新需耗時較久，請勿關閉視窗。")
+            st.warning(f"⚠️ 即將更新 {len(selected_rows)} 家公司的財務數據。請勿關閉視窗。")
             
             if st.button("🚀 開始批量更新 (Batch Update)", type="primary"):
                 progress_bar = st.progress(0)
@@ -317,7 +328,7 @@ with tab1:
                         log_area.write(f"❌ {code} {name}: {msg}")
                     
                     progress_bar.progress((i + 1) / total)
-                    time.sleep(1.5) # 暫停 1.5 秒避免被 Yahoo 封鎖
+                    time.sleep(1.0) # 暫停 1 秒避免被封鎖
                 
                 status_text.success(f"🎉 任務完成！成功更新 {success_count}/{total} 家公司。")
 
