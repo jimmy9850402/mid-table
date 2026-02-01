@@ -46,16 +46,25 @@ def get_all_tw_companies():
             dfs = pd.read_html(response.text)
             df = dfs[0]
             
+            # 資料清理
             df.columns = df.iloc[0]
             df = df.iloc[1:]
             df = df[df['有價證券代號及名稱'].notna()]
+            
+            # 只要股票
             df_stock = df[df['有價證券代號及名稱'].str.contains('　')]
+            
+            # 拆分 代號 與 名稱
             df_stock[['代號', '名稱']] = df_stock['有價證券代號及名稱'].str.split('　', expand=True).iloc[:, :2]
             df_stock['市場別'] = market_name
             
-            target_cols = ['代號', '名稱', '市場別', '上市日']
+            # 🔥 修正點：將 '產業別' 加回目標欄位，並做防呆處理
+            target_cols = ['代號', '名稱', '市場別', '產業別', '上市日']
+            
+            # 確保欄位存在，若無則補 "-" (避免 KeyError)
             for col in target_cols:
-                if col not in df_stock.columns: df_stock[col] = "-"
+                if col not in df_stock.columns:
+                    df_stock[col] = "-"
             
             clean_df = df_stock[target_cols]
             clean_df = clean_df[clean_df['代號'].str.match(r'^\d{4}$')]
@@ -81,7 +90,7 @@ def date_to_roc_year(date_obj):
     year_roc = date_obj.year - 1911
     return f"{year_roc}年"
 
-# --- 4. 核心爬蟲邏輯 (修復版：抓取年度+季度) ---
+# --- 4. 核心爬蟲邏輯 (含年度+季度) ---
 def fetch_and_upload_data(stock_code, stock_name_tw=None, market_type="上市"):
     """
     抓取季度與年度報表並合併
@@ -110,7 +119,7 @@ def fetch_and_upload_data(stock_code, stock_name_tw=None, market_type="上市"):
         df_q_sorted = df_q.sort_index(ascending=False).head(12)
 
         # ==========================================
-        # 步驟 B: 抓取「年度」報表 (Annual) - 新增功能 🔥
+        # 步驟 B: 抓取「年度」報表 (Annual)
         # ==========================================
         a_bs = stock.balance_sheet
         a_is = stock.financials
@@ -205,7 +214,7 @@ def extract_value(df, date_idx, target_name, mapping):
                 return f"{found_val:.2f}"
     return "-"
 
-# --- 5. UI 介面 (保持不變) ---
+# --- 5. UI 介面 ---
 with st.sidebar:
     st.header("💾 資料庫狀態")
     if st.button("🔄 刷新資料庫列表"):
@@ -226,14 +235,17 @@ with tab1:
     col_src1, col_src2 = st.columns(2)
     with col_src1:
         if st.button("🌐 下載全市場最新清單"):
-            with st.spinner("下載中..."):
+            with st.spinner("下載中 (含上市/櫃/興櫃)..."):
                 df = get_all_tw_companies()
                 if not df.empty:
                     st.session_state.twse_df = df
                     st.success(f"成功載入 {len(df)} 家公司")
+                else:
+                    st.error("清單載入失敗，請稍後再試")
+
     with col_src2:
         if st.button("💾 載入 Supabase 清單"):
-            with st.spinner("讀取中..."):
+            with st.spinner("讀取資料庫..."):
                 try:
                     res = supabase.table("underwriting_cache").select("code, name, updated_at").execute()
                     if res.data:
@@ -244,26 +256,40 @@ with tab1:
                         df_db['上市日'] = df_db['updated_at'].apply(lambda x: str(x)[:10])
                         st.session_state.twse_df = df_db
                         st.success(f"成功載入 {len(df_db)} 筆")
-                except Exception as e: st.error(f"失敗: {e}")
+                except Exception as e: st.error(f"讀取失敗: {e}")
 
     if 'twse_df' in st.session_state and st.session_state.twse_df is not None:
         df = st.session_state.twse_df
         st.markdown("---")
-        c1, c2, c3 = st.columns(3)
-        with c1: mkt = st.selectbox("市場", ["全部"] + list(df['市場別'].unique()))
-        with c2: ind = st.selectbox("產業", ["全部"] + list(df['產業別'].unique()))
-        with c3: txt = st.text_input("搜尋", "")
         
+        # 篩選器 UI
+        c1, c2, c3 = st.columns(3)
+        with c1: 
+            all_mkts = ["全部"] + list(df['市場別'].unique())
+            mkt = st.selectbox("市場", all_mkts)
+            
+        with c2: 
+            # 防呆：確保有產業別欄位
+            if '產業別' in df.columns:
+                all_inds = ["全部"] + list(df['產業別'].unique())
+            else:
+                all_inds = ["全部"]
+            ind = st.selectbox("產業", all_inds)
+            
+        with c3: txt = st.text_input("搜尋 (代號/名稱)", "")
+        
+        # 篩選邏輯
         f_df = df.copy()
         if mkt != "全部": f_df = f_df[f_df['市場別'] == mkt]
-        if ind != "全部": f_df = f_df[f_df['產業別'] == ind]
+        if ind != "全部" and '產業別' in f_df.columns: f_df = f_df[f_df['產業別'] == ind]
         if txt: f_df = f_df[f_df['代號'].str.contains(txt) | f_df['名稱'].str.contains(txt)]
         
-        st.write(f"共 {len(f_df)} 筆")
+        st.write(f"顯示 {len(f_df)} 筆資料:")
         
         # 全選邏輯
         if 'editor_key' not in st.session_state: st.session_state.editor_key = 0
         if 'def_sel' not in st.session_state: st.session_state.def_sel = False
+        
         cb1, cb2, _ = st.columns([1,1,6])
         if cb1.button("✅ 全選"): 
             st.session_state.def_sel = True
@@ -275,7 +301,10 @@ with tab1:
             st.rerun()
             
         f_df['選取'] = st.session_state.def_sel
-        valid_cols = [c for c in ['選取', '代號', '名稱', '市場別', '產業別', '上市日'] if c in f_df.columns]
+        
+        # 確保顯示欄位存在
+        display_cols = ['選取', '代號', '名稱', '市場別', '產業別', '上市日']
+        valid_cols = [c for c in display_cols if c in f_df.columns]
         
         edited_df = st.data_editor(
             f_df[valid_cols], hide_index=True,
@@ -285,26 +314,33 @@ with tab1:
         )
         
         sel_rows = edited_df[edited_df['選取'] == True]
-        if not sel_rows.empty and st.button("🚀 執行更新"):
-            p_bar = st.progress(0)
-            status = st.empty()
-            total = len(sel_rows)
-            for i, row in enumerate(sel_rows.itertuples()):
-                code = getattr(row, '代號')
-                name = getattr(row, '名稱')
-                mkt_type = getattr(row, '市場別', '上市')
-                status.text(f"處理中 ({i+1}/{total}): {code}")
-                fetch_and_upload_data(code, name, mkt_type)
-                p_bar.progress((i+1)/total)
-                time.sleep(1)
-            status.success("完成")
+        if not sel_rows.empty:
+            st.warning(f"⚠️ 即將更新 {len(sel_rows)} 家公司")
+            if st.button("🚀 執行批量更新", type="primary"):
+                p_bar = st.progress(0)
+                status = st.empty()
+                total = len(sel_rows)
+                for i, row in enumerate(sel_rows.itertuples()):
+                    # 安全取得屬性 (避免 AttributeError)
+                    code = getattr(row, '代號') if hasattr(row, '代號') else row._2 # 備用
+                    name = getattr(row, '名稱') if hasattr(row, '名稱') else row._3
+                    mkt_type = getattr(row, '市場別', '上市') if hasattr(row, '市場別') else "上市"
+                    
+                    status.text(f"處理中 ({i+1}/{total}): {code} {name}")
+                    fetch_and_upload_data(code, name, mkt_type)
+                    p_bar.progress((i+1)/total)
+                    time.sleep(1) # 避免封鎖
+                status.success("🎉 批量更新完成！")
 
 with tab2:
-    st.markdown("### 手動查詢")
-    s_in = st.text_input("代號", value="2330")
-    m_type = st.radio("市場", ["上市", "上櫃/興櫃"], horizontal=True)
-    if st.button("執行單筆"):
-        real_mkt = "上市" if "上市" in m_type else "上櫃"
-        suc, msg = fetch_and_upload_data(s_in, market_type=real_mkt)
-        if suc: st.success(msg)
-        else: st.error(msg)
+    st.markdown("### 📝 手動單筆查詢")
+    s_in = st.text_input("輸入股票代號", value="2330", help="例如 2330, 8069")
+    m_type = st.radio("選擇市場", ["上市", "上櫃/興櫃"], horizontal=True)
+    
+    if st.button("執行單筆採集", type="primary"):
+        if s_in:
+            real_mkt = "上市" if "上市" in m_type else "上櫃"
+            with st.spinner(f"正在抓取 {s_in} ({real_mkt})..."):
+                suc, msg = fetch_and_upload_data(s_in, market_type=real_mkt)
+                if suc: st.success(msg)
+                else: st.error(msg)
