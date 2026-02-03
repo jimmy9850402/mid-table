@@ -9,14 +9,14 @@ import requests
 import ssl
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 
-# 忽略 SSL 警告 (避免爬蟲時因為憑證問題報錯)
+# 忽略 SSL 警告
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 # --- 1. 初始化設定 ---
 st.set_page_config(page_title="富邦 D&O 全台股採集中心", layout="wide", page_icon="📊")
-st.title("📊 D&O 智能核保 - 全台股自動化採集中心 (含 EPS 自動補算)")
+st.title("📊 D&O 智能核保 - 全台股自動化採集中心 (含年度報表)")
 
-# 讀取 Supabase 設定 (優先讀取環境變數，若無則讀取 Streamlit Secrets)
+# 讀取 Supabase 設定
 SUPABASE_URL = os.getenv("SUPABASE_URL") or st.secrets.get("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY") or st.secrets.get("SUPABASE_KEY")
 
@@ -58,8 +58,10 @@ def get_all_tw_companies():
             df_stock[['代號', '名稱']] = df_stock['有價證券代號及名稱'].str.split('　', expand=True).iloc[:, :2]
             df_stock['市場別'] = market_name
             
-            # 防呆：確保欄位存在
+            # 🔥 修正點：將 '產業別' 加回目標欄位，並做防呆處理
             target_cols = ['代號', '名稱', '市場別', '產業別', '上市日']
+            
+            # 確保欄位存在，若無則補 "-" (避免 KeyError)
             for col in target_cols:
                 if col not in df_stock.columns:
                     df_stock[col] = "-"
@@ -88,74 +90,7 @@ def date_to_roc_year(date_obj):
     year_roc = date_obj.year - 1911
     return f"{year_roc}年"
 
-# --- 🔥 強健版 Smart EPS 計算器 ---
-def get_smart_eps_dict(stock):
-    """
-    強健版 EPS 計算器：不依賴固定日期，而是掃描該年度所有季度資料。
-    修復了因為日期沒對上導致 Q1 被漏算，進而讓 Q4 算錯的問題。
-    """
-    smart_dict = {}
-    try:
-        # 1. 取得數據 (容錯處理)
-        # 注意：Yahoo 回傳的是 Series，Index 是 Timestamp
-        q_eps = stock.quarterly_financials.loc["Basic EPS"] if "Basic EPS" in stock.quarterly_financials.index else pd.Series(dtype=float)
-        a_eps = stock.financials.loc["Basic EPS"] if "Basic EPS" in stock.financials.index else pd.Series(dtype=float)
-        
-        # 2. 遍歷每一個「年度財報」 (例如 2024, 2023...)
-        for year_date in a_eps.index:
-            target_year = year_date.year  # 例如 2024
-            year_total = float(a_eps[year_date]) # 強制轉 float
-            
-            # 3. 找出該年度的所有「季報」
-            # 不論日期是 3/30 還是 3/31，只要年份對就抓出來
-            if not q_eps.empty:
-                quarters_in_year = q_eps[q_eps.index.year == target_year].sort_index()
-            else:
-                quarters_in_year = pd.Series(dtype=float)
-            
-            # 用來累加已知的季度數值
-            known_quarters_sum = 0.0
-            
-            # 4. 處理每一季 (填入已知數據到字典)
-            for q_date, q_val in quarters_in_year.items():
-                val = float(q_val)
-                roc_q = date_to_roc_quarter(q_date) # 轉成 "113年 Q1"
-                
-                # 存入字典
-                smart_dict[roc_q] = f"{val:.2f}"
-                
-                # 如果這不是 Q4 (通常 Q4 是 10, 11, 12月)，就加入累加
-                # Yahoo 季報日期通常是月底：3/31, 6/30, 9/30, 12/31
-                if q_date.month < 10:
-                    known_quarters_sum += val
-            
-            # 5. 🔥 關鍵修正：Q4 補洞運算 🔥
-            # 我們的目標 key
-            q4_key = f"{target_year - 1911}年 Q4"
-            
-            # 檢查規則：
-            # A. 如果字典裡還沒有 Q4 (代表 Yahoo 沒給單季資料)
-            # B. 或者字典裡的 Q4 是 0 (有時候 Yahoo 會給 0)，但年度總和明顯有值
-            is_q4_missing = q4_key not in smart_dict
-            is_q4_zero_but_annual_exists = (smart_dict.get(q4_key) == "0.00" or smart_dict.get(q4_key) == "0") and (abs(year_total) > 0.05)
-            
-            if is_q4_missing or is_q4_zero_but_annual_exists:
-                # 只有當我們至少抓到了前幾季的資料 (避免整年都沒資料亂算)
-                if not quarters_in_year.empty:
-                    # 數學公式：Q4 = 年度總和 - (Q1+Q2+Q3)
-                    calculated_q4 = year_total - known_quarters_sum
-                    
-                    # 寫入字典
-                    smart_dict[q4_key] = f"{calculated_q4:.2f}"
-                    # print(f"💡 [自動修補] {target_year} Q4: {year_total} - {known_quarters_sum} = {calculated_q4:.2f}")
-
-    except Exception as e:
-        print(f"Smart EPS Error: {e}")
-        return {}
-    
-    return smart_dict
-
-# --- 4. 核心爬蟲邏輯 (含年度+季度+EPS補算) ---
+# --- 4. 核心爬蟲邏輯 (含年度+季度) ---
 def fetch_and_upload_data(stock_code, stock_name_tw=None, market_type="上市"):
     """
     抓取季度與年度報表並合併
@@ -166,9 +101,6 @@ def fetch_and_upload_data(stock_code, stock_name_tw=None, market_type="上市"):
     stock = yf.Ticker(ticker_symbol)
     
     try:
-        # 🔥 步驟 0: 先算出 Smart EPS 字典 (補洞用)
-        smart_eps_lookup = get_smart_eps_dict(stock)
-
         # ==========================================
         # 步驟 A: 抓取「季度」報表 (Quarterly)
         # ==========================================
@@ -229,20 +161,8 @@ def fetch_and_upload_data(stock_code, stock_name_tw=None, market_type="上市"):
             # --- 1. 處理季度數據 (Quarterly) ---
             for date_idx in df_q_sorted.index:
                 key_name = date_to_roc_quarter(date_idx) # 格式：114年 Q1
-                
-                # 🔥 關鍵：如果是 EPS，優先查表 Smart Dictionary
-                if target_name == "每股盈餘(EPS)" and key_name in smart_eps_lookup:
-                    row_dict[key_name] = smart_eps_lookup[key_name]
-                else:
-                    # 否則走原本的抓取邏輯
-                    val = extract_value(df_q_sorted, date_idx, target_name, mapping)
-                    row_dict[key_name] = val
-            
-            # 如果是 EPS，還要檢查有沒有 "補算出來的 Q4" (這些可能不在 df_q_sorted 的日期裡)
-            if target_name == "每股盈餘(EPS)":
-                for k, v in smart_eps_lookup.items():
-                    if "Q4" in k and k not in row_dict:
-                        row_dict[k] = v
+                val = extract_value(df_q_sorted, date_idx, target_name, mapping)
+                row_dict[key_name] = val
 
             # --- 2. 處理年度數據 (Annual) ---
             if not df_a_sorted.empty:
