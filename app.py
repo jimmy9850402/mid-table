@@ -14,7 +14,7 @@ requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 # --- 1. 初始化設定 ---
 st.set_page_config(page_title="富邦 D&O 全台股採集中心", layout="wide", page_icon="📊")
-st.title("📊 D&O 智能核保 - 全台股自動化採集中心 (含年度報表)")
+st.title("📊 D&O 智能核保 - 全台股自動化採集中心 (含 EPS 自動補算)")
 
 # 讀取 Supabase 設定
 SUPABASE_URL = os.getenv("SUPABASE_URL") or st.secrets.get("SUPABASE_URL")
@@ -90,7 +90,69 @@ def date_to_roc_year(date_obj):
     year_roc = date_obj.year - 1911
     return f"{year_roc}年"
 
-# --- 4. 核心爬蟲邏輯 (含年度+季度) ---
+# --- 🔥 新增功能：Smart EPS 計算器 ---
+def get_smart_eps_dict(stock):
+    """
+    計算 EPS 補洞邏輯：
+    針對每一年，如果 Q4 是空的，用 (年度總 EPS - 前三季總和) 算出來。
+    回傳字典格式: {'113年 Q4': '0.52', '112年 Q4': '1.23'}
+    """
+    smart_dict = {}
+    try:
+        # 取得 Basic EPS 的 Series (若無則回傳空)
+        q_eps = stock.quarterly_financials.loc["Basic EPS"] if "Basic EPS" in stock.quarterly_financials.index else pd.Series(dtype=float)
+        a_eps = stock.financials.loc["Basic EPS"] if "Basic EPS" in stock.financials.index else pd.Series(dtype=float)
+        
+        # 遍歷每一個年度 (例如 2024, 2023...)
+        for year_date in a_eps.index:
+            target_year = year_date.year
+            year_total = a_eps[year_date]
+            
+            # 如果年度數據是空的，就跳過
+            if pd.isna(year_total):
+                continue
+
+            # 抓取該年度 Q1, Q2, Q3 (容錯 get)
+            q1 = q_eps.get(pd.Timestamp(f"{target_year}-03-31"), 0)
+            q2 = q_eps.get(pd.Timestamp(f"{target_year}-06-30"), 0)
+            q3 = q_eps.get(pd.Timestamp(f"{target_year}-09-30"), 0)
+            
+            # 檢查原始 Q4 (通常是 12-31)
+            q4_date = pd.Timestamp(f"{target_year}-12-31")
+            q4_raw = q_eps.get(q4_date)
+            
+            final_q4_val = 0
+            is_calculated = False
+
+            # 如果 Q4 是 NaN 或 0，且年度有值，就啟動補算
+            if pd.isna(q4_raw) or q4_raw == 0:
+                # 補算公式
+                calculated_q4 = year_total - (q1 + q2 + q3)
+                final_q4_val = calculated_q4
+                is_calculated = True
+            else:
+                final_q4_val = q4_raw
+            
+            # 將結果存入字典，Key 要對應 date_to_roc_quarter 的格式
+            # 例如 2024-12-31 -> 113年 Q4
+            roc_key = date_to_roc_quarter(q4_date)
+            
+            # 轉成字串 (保留兩位小數)
+            smart_dict[roc_key] = f"{final_q4_val:.2f}"
+            
+            # (選用) 為了保險，也可把 Q1-Q3 存進去，確保數據一致
+            smart_dict[date_to_roc_quarter(pd.Timestamp(f"{target_year}-03-31"))] = f"{q1:.2f}"
+            smart_dict[date_to_roc_quarter(pd.Timestamp(f"{target_year}-06-30"))] = f"{q2:.2f}"
+            smart_dict[date_to_roc_quarter(pd.Timestamp(f"{target_year}-09-30"))] = f"{q3:.2f}"
+
+    except Exception as e:
+        # 運算失敗不卡流程，回傳空字典
+        print(f"Smart EPS Error: {e}")
+        return {}
+    
+    return smart_dict
+
+# --- 4. 核心爬蟲邏輯 (含年度+季度+EPS補算) ---
 def fetch_and_upload_data(stock_code, stock_name_tw=None, market_type="上市"):
     """
     抓取季度與年度報表並合併
@@ -101,6 +163,9 @@ def fetch_and_upload_data(stock_code, stock_name_tw=None, market_type="上市"):
     stock = yf.Ticker(ticker_symbol)
     
     try:
+        # 🔥 步驟 0: 先算出 Smart EPS 字典 (補洞用)
+        smart_eps_lookup = get_smart_eps_dict(stock)
+
         # ==========================================
         # 步驟 A: 抓取「季度」報表 (Quarterly)
         # ==========================================
@@ -161,8 +226,14 @@ def fetch_and_upload_data(stock_code, stock_name_tw=None, market_type="上市"):
             # --- 1. 處理季度數據 (Quarterly) ---
             for date_idx in df_q_sorted.index:
                 key_name = date_to_roc_quarter(date_idx) # 格式：114年 Q1
-                val = extract_value(df_q_sorted, date_idx, target_name, mapping)
-                row_dict[key_name] = val
+                
+                # 🔥 關鍵修改：如果是 EPS 且存在於 Smart Dictionary 中，直接用算好的值
+                if target_name == "每股盈餘(EPS)" and key_name in smart_eps_lookup:
+                    row_dict[key_name] = smart_eps_lookup[key_name]
+                else:
+                    # 否則走原本的抓取邏輯
+                    val = extract_value(df_q_sorted, date_idx, target_name, mapping)
+                    row_dict[key_name] = val
 
             # --- 2. 處理年度數據 (Annual) ---
             if not df_a_sorted.empty:
