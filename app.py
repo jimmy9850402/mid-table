@@ -13,8 +13,8 @@ from requests.packages.urllib3.exceptions import InsecureRequestWarning
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 # --- 1. 初始化設定 ---
-st.set_page_config(page_title="富邦 D&O 補漏採集器 (V9.0)", layout="wide", page_icon="🛡️")
-st.title("🛡️ D&O 智能核保 - 缺漏資料補足系統 (FinMind V8核心)")
+st.set_page_config(page_title="富邦 D&O 補漏採集器 (V9.1)", layout="wide", page_icon="🛡️")
+st.title("🛡️ D&O 智能核保 - 缺漏資料補足系統 (無限分頁版)")
 
 # 讀取 Supabase 設定
 SUPABASE_URL = os.getenv("SUPABASE_URL") or st.secrets.get("SUPABASE_URL")
@@ -67,12 +67,37 @@ def get_all_tw_companies():
         st.error(f"讀取清單失敗: {e}")
         return pd.DataFrame()
 
+# 🔥 重點修正：分頁抓取函式 🔥
 def get_existing_codes():
-    """從 Supabase 取得目前已存在的公司代號"""
+    """從 Supabase 分頁取得所有公司代號 (突破 1000 筆限制)"""
     try:
-        response = supabase.table("underwriting_cache").select("code").range(0, 3000).execute()
-        existing_codes = {str(item['code']) for item in response.data}
-        return existing_codes
+        all_codes = set()
+        start = 0
+        batch_size = 1000 # 每次抓 1000 筆 (配合 Supabase 預設上限)
+        
+        # 顯示進度提示 (因為資料多時可能會花 1-2 秒)
+        progress_text = st.empty()
+        
+        while True:
+            # 請求範圍: 0-999, 1000-1999, ...
+            response = supabase.table("underwriting_cache").select("code").range(start, start + batch_size - 1).execute()
+            data = response.data
+            
+            if not data:
+                break
+                
+            # 將這一批代號加入集合
+            for item in data:
+                all_codes.add(str(item['code']))
+            
+            # 如果這一批抓到的數量 < batch_size，代表已經是最後一頁了，跳出迴圈
+            if len(data) < batch_size:
+                break
+                
+            # 準備抓下一批
+            start += batch_size
+            
+        return all_codes
     except Exception as e:
         st.error(f"讀取資料庫失敗: {e}")
         return set()
@@ -90,7 +115,7 @@ def date_to_roc_year(date_obj):
 # --- 🔥 FinMind 救援投手 (V8 邏輯整合版) ---
 def fetch_finmind_data(stock_code):
     """
-    使用 FinMind API V4 抓取完整財報 (包含 V8 的所有修正與備援邏輯)
+    使用 FinMind API V4 抓取完整財報
     """
     try:
         start_date = (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d')
@@ -115,7 +140,6 @@ def fetch_finmind_data(stock_code):
             except: pass
             return []
 
-        # 抓取 4 大報表
         data_income = get_fm_dataset("TaiwanStockFinancialStatements")
         data_balance = get_fm_dataset("TaiwanStockBalanceSheet")
         data_cash = get_fm_dataset("TaiwanStockCashFlowsStatement")
@@ -128,7 +152,6 @@ def fetch_finmind_data(stock_code):
         
         # --- A. 解析 EPS & 季營收備援 ---
         if data_income:
-            # EPS
             eps_rows = [x for x in data_income if x['type'] in ['EPS', 'BasicEarningsPerShare']]
             if eps_rows:
                 latest = eps_rows[-1]
@@ -136,7 +159,6 @@ def fetch_finmind_data(stock_code):
                 result['EPS_Key'] = key
                 result['EPS_Val'] = f"{latest['value']:.2f}"
             
-            # 備援營收 (如果月營收沒抓到，就用季營收)
             rev_rows = [x for x in data_income if x['type'] in ['OperatingRevenue', 'Revenue', 'TotalOperatingRevenue']]
             if rev_rows:
                 latest = rev_rows[-1]
@@ -144,7 +166,7 @@ def fetch_finmind_data(stock_code):
                 result['Quarterly_Rev_Key'] = key
                 result['Quarterly_Rev_Val'] = f"{int(latest['value']/1000):,}"
 
-        # --- B. 解析 資產負債 (修正 Key: TotalLiabilities & Liabilities) ---
+        # --- B. 解析 資產負債 ---
         if data_balance:
             assets_rows = [x for x in data_balance if x['type'] == 'TotalAssets']
             liab_rows = [x for x in data_balance if x['type'] in ['TotalLiabilities', 'Liabilities']]
@@ -153,15 +175,12 @@ def fetch_finmind_data(stock_code):
                 latest_asset = assets_rows[-1]
                 latest_liab = liab_rows[-1]
                 
-                # 若日期接近 (取資產的日期當 Key)
                 key = date_to_roc_quarter(datetime.strptime(latest_asset['date'], '%Y-%m-%d'))
-                
                 asset_val = latest_asset['value']
                 liab_val = latest_liab['value']
                 
                 result['Assets_Key'] = key
                 result['Assets_Val'] = f"{int(asset_val/1000):,}"
-                
                 result['Liab_Key'] = key
                 result['Liab_Val'] = f"{int(liab_val/1000):,}"
                 
@@ -169,11 +188,11 @@ def fetch_finmind_data(stock_code):
                     ratio = (liab_val / asset_val) * 100
                     result['DebtRatio_Val'] = f"{ratio:.2f}%"
 
-        # --- C. 解析 現金流 (修正 Key: Flows 複數) ---
+        # --- C. 解析 現金流 ---
         if data_cash:
             target_types = [
                 'CashFlowFromOperatingActivities', 
-                'CashFlowsFromOperatingActivities', # 興櫃常見
+                'CashFlowsFromOperatingActivities',
                 'NetCashFlowsFromUsedInOperatingActivities',
                 'NetCashInflowFromOperatingActivities'
             ]
@@ -184,14 +203,13 @@ def fetch_finmind_data(stock_code):
                 result['CF_Key'] = key
                 result['CF_Val'] = f"{int(latest['value']/1000):,}"
 
-        # --- D. 解析 營收 (優先用月營收，沒有則用季營收) ---
+        # --- D. 解析 營收 ---
         if data_rev:
             latest = data_rev[-1]
             key = f"{latest['date'][:7]} (月)"
             result['Rev_Key'] = key
             result['Rev_Val'] = f"{int(latest['revenue']/1000):,}"
         elif 'Quarterly_Rev_Val' in result:
-            # 啟動備援
             result['Rev_Key'] = result['Quarterly_Rev_Key']
             result['Rev_Val'] = result['Quarterly_Rev_Val']
 
@@ -201,7 +219,7 @@ def fetch_finmind_data(stock_code):
         print(f"FinMind Error: {e}")
         return None
 
-# --- 4. 核心爬蟲 (混合雙打) ---
+# --- 4. 核心爬蟲 ---
 def fetch_and_upload_data(stock_code, stock_name_tw=None, market_type="上市"):
     suffix = ".TWO" if market_type in ["上櫃", "興櫃"] else ".TW"
     ticker_symbol = f"{stock_code}{suffix}"
@@ -222,42 +240,35 @@ def fetch_and_upload_data(stock_code, stock_name_tw=None, market_type="上市"):
             if fm_data:
                 source_used = "FinMind"
                 
-                # --- 組裝 FinMind 數據 ---
-                # 1. 營收
                 row_rev = {"項目": "營業收入"}
                 if 'Rev_Key' in fm_data: row_rev[fm_data['Rev_Key']] = fm_data['Rev_Val']
                 
-                # 2. EPS
                 row_eps = {"項目": "每股盈餘(EPS)"}
                 if 'EPS_Key' in fm_data: row_eps[fm_data['EPS_Key']] = fm_data['EPS_Val']
                 
-                # 3. 總資產
                 row_assets = {"項目": "總資產"}
                 if 'Assets_Key' in fm_data: row_assets[fm_data['Assets_Key']] = fm_data['Assets_Val']
                 
-                # 4. 負債比
                 row_debt = {"項目": "負債比"}
                 if 'Assets_Key' in fm_data and 'DebtRatio_Val' in fm_data: 
                     row_debt[fm_data['Assets_Key']] = fm_data['DebtRatio_Val']
                 
-                # 5. 現金流
                 row_cf = {"項目": "營業活動淨現金流"}
                 if 'CF_Key' in fm_data: row_cf[fm_data['CF_Key']] = fm_data['CF_Val']
 
-                # 6. 流動資產/負債 (FinMind 簡易版暫缺，顯示 "-")
                 row_cur_assets = {"項目": "流動資產"}
                 row_cur_liab = {"項目": "流動負債"}
 
                 formatted_data = [
                     row_rev, row_assets, row_debt, 
-                    row_cur_assets, row_cur_liab, # 補齊欄位避免前端報錯
+                    row_cur_assets, row_cur_liab, 
                     row_eps, row_cf,
                     {"項目": "資料來源", "說明": "FinMind (興櫃備援)"}
                 ]
             else:
                 return False, f"❌ 無數據跳過: {stock_name_tw}"
         else:
-            # 2. yfinance 成功 -> 正常處理 (不補算 Q4)
+            # 2. yfinance 成功
             q_cf = stock.quarterly_cashflow 
             df_q = pd.concat([q_is.T, q_bs.T, q_cf.T], axis=1)
             df_q = df_q.loc[:, ~df_q.columns.duplicated()]
@@ -345,14 +356,14 @@ def extract_value(df, date_idx, target_name, mapping):
 tab1, tab2 = st.tabs(["🔍 補漏監控中心", "📝 單筆手動"])
 
 with tab1:
-    st.markdown("### 📉 缺漏名單補足系統 (V9.0)")
+    st.markdown("### 📉 缺漏名單補足系統 (V9.1)")
     
     col1, col2 = st.columns(2)
     with col1:
         if st.button("🔄 1. 掃描缺漏名單", type="primary"):
-            with st.spinner("正在比對中..."):
+            with st.spinner("正在比對中 (讀取所有公司可能需要幾秒鐘)..."):
                 full_df = get_all_tw_companies()
-                db_codes = get_existing_codes()
+                db_codes = get_existing_codes() # 這裡現在會抓回 1950+ 筆
                 
                 if not full_df.empty:
                     full_df['code_str'] = full_df['代號'].astype(str).str.strip()
@@ -360,7 +371,7 @@ with tab1:
                     
                     st.session_state.missing_df = missing_df
                     st.session_state.db_count = len(db_codes)
-                    st.success(f"掃描完成！發現 {len(missing_df)} 家缺漏。")
+                    st.success(f"掃描完成！資料庫現有 {len(db_codes)} 筆，發現 {len(missing_df)} 家缺漏。")
 
     if 'missing_df' in st.session_state:
         m_df = st.session_state.missing_df
