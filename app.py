@@ -13,8 +13,8 @@ from requests.packages.urllib3.exceptions import InsecureRequestWarning
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 # --- 1. 初始化設定 ---
-st.set_page_config(page_title="富邦 D&O 補漏採集器 (V17.0)", layout="wide", page_icon="🛡️")
-st.title("🛡️ D&O 智能核保 - 缺漏資料補足系統 (動態優先級版)")
+st.set_page_config(page_title="富邦 D&O 補漏採集器 (V18.0)", layout="wide", page_icon="🛡️")
+st.title("🛡️ D&O 智能核保 - 缺漏資料補足系統 (現金流強化版)")
 
 # 讀取 Supabase 設定
 SUPABASE_URL = os.getenv("SUPABASE_URL") or st.secrets.get("SUPABASE_URL")
@@ -104,7 +104,7 @@ def date_to_roc_quarter(date_str):
     except:
         return "未知季度"
 
-# --- 🔥 FinMind 救援投手 (V17 動態優先級解析版) ---
+# --- 🔥 FinMind 救援投手 (V18 現金流強化版) ---
 def fetch_finmind_data_history(stock_code):
     try:
         start_date = (datetime.now() - timedelta(days=1095)).strftime('%Y-%m-%d')
@@ -128,7 +128,7 @@ def fetch_finmind_data_history(stock_code):
 
         if not any([data_income, data_balance, data_cash, data_rev]): return None
 
-        # V17 核心：季度歸戶 + 候選人清單
+        # V17/V18 核心：季度歸戶 + 候選人清單
         quarter_buckets = {}
 
         def add_candidate(date_str, category, key, value):
@@ -137,13 +137,16 @@ def fetch_finmind_data_history(stock_code):
                 quarter_buckets[q_str] = {
                     "EPS_Candidates": {},
                     "Rev_Candidates": {},
-                    "Assets": None, "Liabs": None, "CurAssets": None, "CurLiabs": None, "CF": None
+                    "CF_Candidates": {}, # V18 新增：現金流候選區
+                    "Assets": None, "Liabs": None, "CurAssets": None, "CurLiabs": None
                 }
             
             if category == "EPS":
                 quarter_buckets[q_str]["EPS_Candidates"][key] = value
             elif category == "Rev":
                 quarter_buckets[q_str]["Rev_Candidates"][key] = value
+            elif category == "CF":
+                quarter_buckets[q_str]["CF_Candidates"][key] = value
             elif category == "Assets":
                 quarter_buckets[q_str]["Assets"] = value
             elif category == "Liabs":
@@ -152,20 +155,16 @@ def fetch_finmind_data_history(stock_code):
                 quarter_buckets[q_str]["CurAssets"] = value
             elif category == "CurLiabs":
                 quarter_buckets[q_str]["CurLiabs"] = value
-            elif category == "CF":
-                quarter_buckets[q_str]["CF"] = value
 
         # --- A. EPS (收集所有可能) ---
         if data_income:
-            # 白名單
             eps_keys = ['EPS', 'BasicEarningsPerShare', 'EarningsPerShare', 'NetIncomePerShare']
             for row in data_income:
                 if row['type'] in eps_keys:
                     add_candidate(row['date'], "EPS", row['type'], row['value'])
 
-        # --- B. 營收 (收集所有可能，含 Revenue) ---
+        # --- B. 營收 (收集所有可能) ---
         if data_income:
-            # 您的數據證明 'Revenue' 是極高優先級的 Key
             rev_keys = [
                 'OperatingRevenue', 'Revenue', 'TotalOperatingRevenue', 
                 'NetRevenue', 'SalesRevenue', 'InterestIncome', 'InsuranceRevenue', 'GrossProfit'
@@ -183,12 +182,18 @@ def fetch_finmind_data_history(stock_code):
                 if t in ['CurrentAssets', 'TotalCurrentAssets', 'AssetsCurrent']: add_candidate(d, "CurAssets", t, v)
                 if t in ['CurrentLiabilities', 'TotalCurrentLiabilities', 'LiabilitiesCurrent']: add_candidate(d, "CurLiabs", t, v)
 
-        # --- D. 現金流 ---
+        # --- D. 現金流 (收集所有可能 - V18重點) ---
         if data_cash:
-            cf_keys = ['CashFlowFromOperatingActivities', 'CashFlowsFromOperatingActivities', 'NetCashInflowFromOperatingActivities']
+            # 這裡我們只收集看起來像 "營業現金流" 的欄位
+            cf_potential_keys = [
+                'NetCashInflowFromOperatingActivities', # 優先級 1
+                'CashFlowsFromOperatingActivities',     # 優先級 2
+                'CashFlowFromOperatingActivities',      # 優先級 3
+                # 注意：絕對不收集 CashReceivedThroughOperations
+            ]
             for row in data_cash:
-                if row['type'] in cf_keys:
-                    add_candidate(row['date'], "CF", t, row['value'])
+                if row['type'] in cf_potential_keys:
+                    add_candidate(row['date'], "CF", row['type'], row['value'])
 
         # --- E. 優先級解析 (Resolution) ---
         sorted_quarters = sorted(quarter_buckets.keys(), reverse=True)[:6]
@@ -200,6 +205,8 @@ def fetch_finmind_data_history(stock_code):
         # 定義優先順序 (Priority Queue)
         REV_PRIORITY = ['OperatingRevenue', 'Revenue', 'TotalOperatingRevenue', 'NetRevenue', 'InterestIncome', 'GrossProfit']
         EPS_PRIORITY = ['EPS', 'BasicEarningsPerShare', 'EarningsPerShare']
+        # V18 現金流優先級：Net... > CashFlows... > CashFlow...
+        CF_PRIORITY = ['NetCashInflowFromOperatingActivities', 'CashFlowsFromOperatingActivities', 'CashFlowFromOperatingActivities']
 
         for q in sorted_quarters:
             bucket = quarter_buckets[q]
@@ -208,15 +215,21 @@ def fetch_finmind_data_history(stock_code):
             for p_key in EPS_PRIORITY:
                 if p_key in bucket["EPS_Candidates"]:
                     final_struct["每股盈餘(EPS)"][q] = f"{bucket['EPS_Candidates'][p_key]:.2f}"
-                    break # 找到最高優先級就停止
+                    break
 
             # 2. 解析 營收
             for p_key in REV_PRIORITY:
                 if p_key in bucket["Rev_Candidates"]:
                     final_struct["營業收入"][q] = f"{int(bucket['Rev_Candidates'][p_key]/1000):,}"
-                    break # 找到最高優先級 (例如 Revenue) 就停止
+                    break
             
-            # 3. 其他欄位 (直接取值)
+            # 3. 解析 現金流 (V18 新增邏輯)
+            for p_key in CF_PRIORITY:
+                if p_key in bucket["CF_Candidates"]:
+                    final_struct["營業活動淨現金流"][q] = f"{int(bucket['CF_Candidates'][p_key]/1000):,}"
+                    break
+
+            # 4. 其他欄位
             if bucket["Assets"]: 
                 final_struct["總資產"][q] = f"{int(bucket['Assets']/1000):,}"
                 if bucket["Liabs"]:
@@ -227,7 +240,6 @@ def fetch_finmind_data_history(stock_code):
             
             if bucket["CurAssets"]: final_struct["流動資產"][q] = f"{int(bucket['CurAssets']/1000):,}"
             if bucket["CurLiabs"]: final_struct["流動負債"][q] = f"{int(bucket['CurLiabs']/1000):,}"
-            if bucket["CF"]: final_struct["營業活動淨現金流"][q] = f"{int(bucket['CF']/1000):,}"
 
         # 月營收
         if data_rev:
@@ -394,7 +406,7 @@ with tab1:
             st.success(f"補足 {cnt} 家")
 
 with tab2:
-    st.markdown("### 🚑 興櫃資料修補中心 (V17.0 動態優先級)")
+    st.markdown("### 🚑 興櫃資料修補中心 (V18.0 現金流強化)")
     if st.button("🔍 1. 掃描需修補名單"):
         with st.spinner("分析資料庫品質中..."):
             all_data = get_all_db_data()
@@ -462,6 +474,13 @@ with tab3:
                 df = pd.DataFrame(res.json().get('data', []))
                 if not df.empty:
                     st.write("#### 損益表所有欄位 (Keys):")
+                    st.code(list(df['type'].unique()))
+            
+            res = requests.get(base_url, params={"dataset": "TaiwanStockCashFlowsStatement", "data_id": debug_code, "start_date": start_date}, headers=headers)
+            if res.json().get('msg') == 'success':
+                df = pd.DataFrame(res.json().get('data', []))
+                if not df.empty:
+                    st.write("#### 現金流量表所有欄位 (Keys):")
                     st.code(list(df['type'].unique()))
 
 with tab4:
