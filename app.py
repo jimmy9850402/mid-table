@@ -13,8 +13,8 @@ from requests.packages.urllib3.exceptions import InsecureRequestWarning
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 # --- 1. 初始化設定 ---
-st.set_page_config(page_title="富邦 D&O 補漏採集器 (V15.0)", layout="wide", page_icon="🛡️")
-st.title("🛡️ D&O 智能核保 - 缺漏資料補足系統 (全時段聯集版)")
+st.set_page_config(page_title="富邦 D&O 補漏採集器 (V17.0)", layout="wide", page_icon="🛡️")
+st.title("🛡️ D&O 智能核保 - 缺漏資料補足系統 (動態優先級版)")
 
 # 讀取 Supabase 設定
 SUPABASE_URL = os.getenv("SUPABASE_URL") or st.secrets.get("SUPABASE_URL")
@@ -92,19 +92,22 @@ def get_all_db_data():
         return []
 
 # --- 3. 輔助函數 ---
-def date_to_roc_quarter(date_obj):
-    year_roc = date_obj.year - 1911
-    quarter = (date_obj.month - 1) // 3 + 1
-    return f"{year_roc}年 Q{quarter}"
+def date_to_roc_quarter(date_str):
+    try:
+        if isinstance(date_str, str):
+            date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+        else:
+            date_obj = date_str
+        year_roc = date_obj.year - 1911
+        quarter = (date_obj.month - 1) // 3 + 1
+        return f"{year_roc}年 Q{quarter}"
+    except:
+        return "未知季度"
 
-def date_to_roc_year(date_obj):
-    year_roc = date_obj.year - 1911
-    return f"{year_roc}年"
-
-# --- 🔥 FinMind 救援投手 (V15 全時段聯集版) ---
+# --- 🔥 FinMind 救援投手 (V17 動態優先級解析版) ---
 def fetch_finmind_data_history(stock_code):
     try:
-        start_date = (datetime.now() - timedelta(days=1200)).strftime('%Y-%m-%d') # 拉長到 3 年
+        start_date = (datetime.now() - timedelta(days=1095)).strftime('%Y-%m-%d')
         base_url = "https://api.finmindtrade.com/api/v4/data"
         token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJkYXRlIjoiMjAyNi0wMi0wNiAxNDoxNToxMSIsInVzZXJfaWQiOiJqaW1teTk4NTA0MDIiLCJlbWFpbCI6IjExMDI1NTAyNEBnLm5jY3UuZWR1LnR3IiwiaXAiOiIyMjMuMTM3LjEwMC4xMjgifQ.2ou0rtCaMqV7XXPBh28jGWFJ7_4EQrtr2CdhNQ5YznI"
         headers = {"Authorization": f"Bearer {token}"}
@@ -125,123 +128,117 @@ def fetch_finmind_data_history(stock_code):
 
         if not any([data_income, data_balance, data_cash, data_rev]): return None
 
-        # 1. 建立日期集合 (所有來源的日期取聯集)
-        all_dates = set()
+        # V17 核心：季度歸戶 + 候選人清單
+        quarter_buckets = {}
 
-        # 暫存字典 (Date -> Value)
-        temp_data = {
-            "EPS": {}, "Rev": {}, "Assets": {}, "Liabs": {}, 
-            "CurAssets": {}, "CurLiabs": {}, "CF": {}
-        }
+        def add_candidate(date_str, category, key, value):
+            q_str = date_to_roc_quarter(date_str)
+            if q_str not in quarter_buckets:
+                quarter_buckets[q_str] = {
+                    "EPS_Candidates": {},
+                    "Rev_Candidates": {},
+                    "Assets": None, "Liabs": None, "CurAssets": None, "CurLiabs": None, "CF": None
+                }
+            
+            if category == "EPS":
+                quarter_buckets[q_str]["EPS_Candidates"][key] = value
+            elif category == "Rev":
+                quarter_buckets[q_str]["Rev_Candidates"][key] = value
+            elif category == "Assets":
+                quarter_buckets[q_str]["Assets"] = value
+            elif category == "Liabs":
+                quarter_buckets[q_str]["Liabs"] = value
+            elif category == "CurAssets":
+                quarter_buckets[q_str]["CurAssets"] = value
+            elif category == "CurLiabs":
+                quarter_buckets[q_str]["CurLiabs"] = value
+            elif category == "CF":
+                quarter_buckets[q_str]["CF"] = value
 
-        # --- A. EPS (含白名單) ---
+        # --- A. EPS (收集所有可能) ---
         if data_income:
+            # 白名單
             eps_keys = ['EPS', 'BasicEarningsPerShare', 'EarningsPerShare', 'NetIncomePerShare']
             for row in data_income:
                 if row['type'] in eps_keys:
-                    all_dates.add(row['date'])
-                    temp_data["EPS"][row['date']] = row['value']
+                    add_candidate(row['date'], "EPS", row['type'], row['value'])
 
-        # --- B. 營收 (白名單優先) ---
-        # 1. 月營收
-        if data_rev:
-            for row in data_rev:
-                # 月營收日期格式較特殊，這裡主要用於顯示最新月，不混入季度排序
-                pass 
-        
-        # 2. 季營收 (當月營收缺漏時)
+        # --- B. 營收 (收集所有可能，含 Revenue) ---
         if data_income:
+            # 您的數據證明 'Revenue' 是極高優先級的 Key
             rev_keys = [
-                'OperatingRevenue', 'TotalOperatingRevenue', 'Revenue', 'NetRevenue', 
-                'InterestIncome', 'InterestNetIncome', 'InsuranceRevenue', 'PremiumIncome', 'GrossProfit'
+                'OperatingRevenue', 'Revenue', 'TotalOperatingRevenue', 
+                'NetRevenue', 'SalesRevenue', 'InterestIncome', 'InsuranceRevenue', 'GrossProfit'
             ]
-            # 找出最佳 Key
-            best_rev_key = None
-            avail_types = {x['type'] for x in data_income}
-            for k in rev_keys:
-                if k in avail_types: 
-                    best_rev_key = k; break
-            
-            if best_rev_key:
-                for row in data_income:
-                    if row['type'] == best_rev_key:
-                        all_dates.add(row['date'])
-                        temp_data["Rev"][row['date']] = row['value']
+            for row in data_income:
+                if row['type'] in rev_keys:
+                    add_candidate(row['date'], "Rev", row['type'], row['value'])
 
-        # --- C. 資產負債 (含流動資產擴充) ---
+        # --- C. 資產負債 ---
         if data_balance:
             for row in data_balance:
-                d, v, t = row['date'], row['value'], row['type']
-                
-                # 總資產
-                if t in ['TotalAssets', 'Assets']: 
-                    all_dates.add(d)
-                    temp_data["Assets"][d] = v
-                
-                # 總負債
-                if t in ['TotalLiabilities', 'Liabilities']:
-                    all_dates.add(d)
-                    temp_data["Liabs"][d] = v
-                
-                # 流動資產 (擴充關鍵字)
-                if t in ['CurrentAssets', 'TotalCurrentAssets', 'AssetsCurrent']:
-                    temp_data["CurAssets"][d] = v
-                
-                # 流動負債 (擴充關鍵字)
-                if t in ['CurrentLiabilities', 'TotalCurrentLiabilities', 'LiabilitiesCurrent']:
-                    temp_data["CurLiabs"][d] = v
+                t, d, v = row['type'], row['date'], row['value']
+                if t in ['TotalAssets', 'Assets']: add_candidate(d, "Assets", t, v)
+                if t in ['TotalLiabilities', 'Liabilities']: add_candidate(d, "Liabs", t, v)
+                if t in ['CurrentAssets', 'TotalCurrentAssets', 'AssetsCurrent']: add_candidate(d, "CurAssets", t, v)
+                if t in ['CurrentLiabilities', 'TotalCurrentLiabilities', 'LiabilitiesCurrent']: add_candidate(d, "CurLiabs", t, v)
 
         # --- D. 現金流 ---
         if data_cash:
             cf_keys = ['CashFlowFromOperatingActivities', 'CashFlowsFromOperatingActivities', 'NetCashInflowFromOperatingActivities']
             for row in data_cash:
                 if row['type'] in cf_keys:
-                    all_dates.add(row['date'])
-                    temp_data["CF"][row['date']] = row['value']
+                    add_candidate(row['date'], "CF", t, row['value'])
 
-        # --- 2. 整合輸出 (日期由新到舊) ---
-        sorted_dates = sorted(list(all_dates), reverse=True)[:6] # 取最近 6 個有資料的時間點
-        
+        # --- E. 優先級解析 (Resolution) ---
+        sorted_quarters = sorted(quarter_buckets.keys(), reverse=True)[:6]
         final_struct = {
             "營業收入": {}, "每股盈餘(EPS)": {}, "總資產": {}, "總負債": {},
             "流動資產": {}, "流動負債": {}, "負債比": {}, "營業活動淨現金流": {}
         }
 
-        for d in sorted_dates:
-            q_key = date_to_roc_quarter(datetime.strptime(d, '%Y-%m-%d'))
-            
-            # EPS
-            if d in temp_data["EPS"]: final_struct["每股盈餘(EPS)"][q_key] = f"{temp_data['EPS'][d]:.2f}"
-            
-            # 營收 (季)
-            if d in temp_data["Rev"]: final_struct["營業收入"][q_key] = f"{int(temp_data['Rev'][d]/1000):,}"
-            
-            # 資產
-            if d in temp_data["Assets"]: 
-                final_struct["總資產"][q_key] = f"{int(temp_data['Assets'][d]/1000):,}"
-                # 計算負債比
-                if d in temp_data["Liabs"]:
-                    final_struct["總負債"][q_key] = f"{int(temp_data['Liabs'][d]/1000):,}"
-                    if temp_data["Assets"][d] > 0:
-                        final_struct["負債比"][q_key] = f"{(temp_data['Liabs'][d] / temp_data['Assets'][d]) * 100:.2f}%"
-            
-            # 流動資產/負債
-            if d in temp_data["CurAssets"]: final_struct["流動資產"][q_key] = f"{int(temp_data['CurAssets'][d]/1000):,}"
-            if d in temp_data["CurLiabs"]: final_struct["流動負債"][q_key] = f"{int(temp_data['CurLiabs'][d]/1000):,}"
-            
-            # 現金流
-            if d in temp_data["CF"]: final_struct["營業活動淨現金流"][q_key] = f"{int(temp_data['CF'][d]/1000):,}"
+        # 定義優先順序 (Priority Queue)
+        REV_PRIORITY = ['OperatingRevenue', 'Revenue', 'TotalOperatingRevenue', 'NetRevenue', 'InterestIncome', 'GrossProfit']
+        EPS_PRIORITY = ['EPS', 'BasicEarningsPerShare', 'EarningsPerShare']
 
-        # 月營收特別處理 (不放入季度迴圈)
+        for q in sorted_quarters:
+            bucket = quarter_buckets[q]
+
+            # 1. 解析 EPS
+            for p_key in EPS_PRIORITY:
+                if p_key in bucket["EPS_Candidates"]:
+                    final_struct["每股盈餘(EPS)"][q] = f"{bucket['EPS_Candidates'][p_key]:.2f}"
+                    break # 找到最高優先級就停止
+
+            # 2. 解析 營收
+            for p_key in REV_PRIORITY:
+                if p_key in bucket["Rev_Candidates"]:
+                    final_struct["營業收入"][q] = f"{int(bucket['Rev_Candidates'][p_key]/1000):,}"
+                    break # 找到最高優先級 (例如 Revenue) 就停止
+            
+            # 3. 其他欄位 (直接取值)
+            if bucket["Assets"]: 
+                final_struct["總資產"][q] = f"{int(bucket['Assets']/1000):,}"
+                if bucket["Liabs"]:
+                    final_struct["總負債"][q] = f"{int(bucket['Liabs']/1000):,}"
+                    if bucket["Assets"] > 0:
+                        ratio = (bucket["Liabs"] / bucket["Assets"]) * 100
+                        final_struct["負債比"][q] = f"{ratio:.2f}%"
+            
+            if bucket["CurAssets"]: final_struct["流動資產"][q] = f"{int(bucket['CurAssets']/1000):,}"
+            if bucket["CurLiabs"]: final_struct["流動負債"][q] = f"{int(bucket['CurLiabs']/1000):,}"
+            if bucket["CF"]: final_struct["營業活動淨現金流"][q] = f"{int(bucket['CF']/1000):,}"
+
+        # 月營收
         if data_rev:
             rows = sorted(data_rev, key=lambda x: x['date'], reverse=True)
             for row in rows[:8]:
                 m_key = f"{row['date'][:7]} (月)"
                 final_struct["營業收入"][m_key] = f"{int(row['revenue']/1000):,}"
 
-        # 轉 List
         formatted_list = []
         order = ["營業收入", "總資產", "總負債", "負債比", "流動資產", "流動負債", "每股盈餘(EPS)", "營業活動淨現金流"]
+        
         for item_name in order:
             if final_struct[item_name]:
                 row_dict = {"項目": item_name}
@@ -253,7 +250,9 @@ def fetch_finmind_data_history(stock_code):
         formatted_list.append({"項目": "資料來源", "說明": "FinMind (興櫃備援)"})
         return formatted_list
 
-    except: return None
+    except Exception as e:
+        print(f"Error: {e}")
+        return None
 
 # --- 4. 核心爬蟲 ---
 def fetch_and_upload_data(stock_code, stock_name_tw=None, market_type="上市", force_finmind=False):
@@ -395,9 +394,9 @@ with tab1:
             st.success(f"補足 {cnt} 家")
 
 with tab2:
-    st.markdown("### 🚑 興櫃資料修補中心 (V15.0 全時段)")
+    st.markdown("### 🚑 興櫃資料修補中心 (V17.0 動態優先級)")
     if st.button("🔍 1. 掃描需修補名單"):
-        with st.spinner("分析資料庫..."):
+        with st.spinner("分析資料庫品質中..."):
             all_data = get_all_db_data()
             repair_list = []
             for item in all_data:
@@ -442,7 +441,6 @@ with tab2:
 
 with tab3:
     st.markdown("### 🕵️ 深度診斷 (Debug)")
-    st.info("輸入公司代號，直接查詢 FinMind 回傳的原始欄位名稱 (Key)，用於診斷為何抓不到。")
     debug_code = st.text_input("代號", value="1269")
     if st.button("診斷此公司"):
         with st.spinner("診斷中..."):
@@ -451,7 +449,6 @@ with tab3:
             base_url = "https://api.finmindtrade.com/api/v4/data"
             start_date = (datetime.now() - timedelta(days=900)).strftime('%Y-%m-%d')
             
-            # 診斷資產負債表
             res = requests.get(base_url, params={"dataset": "TaiwanStockBalanceSheet", "data_id": debug_code, "start_date": start_date}, headers=headers)
             if res.json().get('msg') == 'success':
                 df = pd.DataFrame(res.json().get('data', []))
@@ -459,8 +456,7 @@ with tab3:
                     st.write("#### 資產負債表所有欄位 (Keys):")
                     st.code(list(df['type'].unique()))
                 else: st.warning("資產負債表無資料")
-            
-            # 診斷損益表
+
             res = requests.get(base_url, params={"dataset": "TaiwanStockFinancialStatements", "data_id": debug_code, "start_date": start_date}, headers=headers)
             if res.json().get('msg') == 'success':
                 df = pd.DataFrame(res.json().get('data', []))
