@@ -13,8 +13,8 @@ from requests.packages.urllib3.exceptions import InsecureRequestWarning
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 # --- 1. 初始化設定 ---
-st.set_page_config(page_title="富邦 D&O 補漏採集器 (V10.0)", layout="wide", page_icon="🛡️")
-st.title("🛡️ D&O 智能核保 - 缺漏資料補足系統 (歷史趨勢版)")
+st.set_page_config(page_title="富邦 D&O 補漏採集器 (V10.1)", layout="wide", page_icon="🛡️")
+st.title("🛡️ D&O 智能核保 - 缺漏資料補足系統 (防火牆突破版)")
 
 # 讀取 Supabase 設定
 SUPABASE_URL = os.getenv("SUPABASE_URL") or st.secrets.get("SUPABASE_URL")
@@ -26,10 +26,10 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# --- 2. 核心功能：抓取市場總表 ---
+# --- 2. 核心功能：抓取市場總表 (🔥修復 ConnectionResetError) ---
 @st.cache_data(ttl=3600)
 def get_all_tw_companies():
-    """從證交所抓取並合併清單"""
+    """從證交所抓取並合併清單 (加入瀏覽器偽裝)"""
     sources = [
         ("上市", "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"),
         ("上櫃", "https://isin.twse.com.tw/isin/C_public.jsp?strMode=4"),
@@ -37,10 +37,20 @@ def get_all_tw_companies():
     ]
     all_dfs = []
     
+    # 建立一個 Session 並設定偽裝 Header
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7'
+    })
+
     try:
         for market_name, url in sources:
-            response = requests.get(url, verify=False)
+            # 加入 timeout 與 verify=False
+            response = session.get(url, verify=False, timeout=15)
             response.encoding = 'cp950'
+            
             dfs = pd.read_html(response.text)
             df = dfs[0]
             
@@ -60,11 +70,14 @@ def get_all_tw_companies():
             clean_df = clean_df[clean_df['代號'].str.match(r'^\d{4}$')]
             all_dfs.append(clean_df)
             
+            # 禮貌性暫停，避免被鎖 IP
+            time.sleep(1)
+            
         if all_dfs:
             return pd.concat(all_dfs, ignore_index=True)
         return pd.DataFrame()
     except Exception as e:
-        st.error(f"讀取清單失敗: {e}")
+        st.error(f"讀取清單失敗 (請稍後再試): {e}")
         return pd.DataFrame()
 
 def get_existing_codes():
@@ -105,10 +118,8 @@ def date_to_roc_year(date_obj):
 def fetch_finmind_data_history(stock_code):
     """
     使用 FinMind API V4 抓取歷史趨勢數據 (近 5 季)
-    直接回傳 formatted_data 列表格式
     """
     try:
-        # 抓近 2.5 年 (900天) 以確保能涵蓋完整歷史
         start_date = (datetime.now() - timedelta(days=900)).strftime('%Y-%m-%d')
         base_url = "https://api.finmindtrade.com/api/v4/data"
         
@@ -129,7 +140,6 @@ def fetch_finmind_data_history(stock_code):
             except: pass
             return []
 
-        # 下載資料
         data_income = get_fm_dataset("TaiwanStockFinancialStatements")
         data_balance = get_fm_dataset("TaiwanStockBalanceSheet")
         data_cash = get_fm_dataset("TaiwanStockCashFlowsStatement")
@@ -138,8 +148,6 @@ def fetch_finmind_data_history(stock_code):
         if not any([data_income, data_balance, data_cash, data_rev]):
             return None
 
-        # 初始化結果字典結構
-        # 格式: { "每股盈餘(EPS)": {"114年 Q2": 1.5, "114年 Q1": 1.2}, ... }
         parsed_data = {
             "營業收入": {}, 
             "每股盈餘(EPS)": {}, 
@@ -153,16 +161,14 @@ def fetch_finmind_data_history(stock_code):
 
         # --- 1. EPS ---
         if data_income:
-            # 篩選並反轉排序(最新的在前)
             rows = [x for x in data_income if x['type'] in ['EPS', 'BasicEarningsPerShare']]
             rows.sort(key=lambda x: x['date'], reverse=True)
-            for row in rows[:6]: # 取近 6 季
+            for row in rows[:6]:
                 q_key = date_to_roc_quarter(datetime.strptime(row['date'], '%Y-%m-%d'))
                 parsed_data["每股盈餘(EPS)"][q_key] = f"{row['value']:.2f}"
 
-        # --- 2. 資產負債表 (資產, 負債, 流動資產, 流動負債) ---
+        # --- 2. 資產負債 ---
         if data_balance:
-            # 分組處理
             assets = {} 
             liabs = {}
             cur_assets = {}
@@ -172,21 +178,17 @@ def fetch_finmind_data_history(stock_code):
                 d = row['date']
                 v = row['value']
                 t = row['type']
-                
                 if t == 'TotalAssets': assets[d] = v
                 elif t in ['TotalLiabilities', 'Liabilities']: liabs[d] = v
                 elif t in ['CurrentAssets']: cur_assets[d] = v
                 elif t in ['CurrentLiabilities', 'LiabilitiesCurrent']: cur_liabs[d] = v
             
-            # 整合日期並寫入 (以總資產日期為主)
             sorted_dates = sorted(assets.keys(), reverse=True)[:6]
             for d in sorted_dates:
                 q_key = date_to_roc_quarter(datetime.strptime(d, '%Y-%m-%d'))
                 
-                # 總資產
                 parsed_data["總資產"][q_key] = f"{int(assets[d]/1000):,}"
                 
-                # 總負債 & 負債比
                 if d in liabs:
                     l_val = liabs[d]
                     parsed_data["總負債"][q_key] = f"{int(l_val/1000):,}"
@@ -194,13 +196,8 @@ def fetch_finmind_data_history(stock_code):
                         ratio = (l_val / assets[d]) * 100
                         parsed_data["負債比"][q_key] = f"{ratio:.2f}%"
                 
-                # 流動資產
-                if d in cur_assets:
-                    parsed_data["流動資產"][q_key] = f"{int(cur_assets[d]/1000):,}"
-                
-                # 流動負債
-                if d in cur_liabs:
-                    parsed_data["流動負債"][q_key] = f"{int(cur_liabs[d]/1000):,}"
+                if d in cur_assets: parsed_data["流動資產"][q_key] = f"{int(cur_assets[d]/1000):,}"
+                if d in cur_liabs: parsed_data["流動負債"][q_key] = f"{int(cur_liabs[d]/1000):,}"
 
         # --- 3. 現金流 ---
         if data_cash:
@@ -212,31 +209,26 @@ def fetch_finmind_data_history(stock_code):
                 q_key = date_to_roc_quarter(datetime.strptime(row['date'], '%Y-%m-%d'))
                 parsed_data["營業活動淨現金流"][q_key] = f"{int(row['value']/1000):,}"
 
-        # --- 4. 營收 (特殊處理：抓近 8 個月) ---
+        # --- 4. 營收 ---
         if data_rev:
             rows = sorted(data_rev, key=lambda x: x['date'], reverse=True)
             for row in rows[:8]:
-                m_key = f"{row['date'][:7]} (月)" # 2025-06 (月)
+                m_key = f"{row['date'][:7]} (月)"
                 parsed_data["營業收入"][m_key] = f"{int(row['revenue']/1000):,}"
 
-        # --- 5. 轉換成最終 List 格式 ---
+        # --- 5. 格式化輸出 ---
         formatted_list = []
-        
-        # 定義顯示順序
         order = ["營業收入", "總資產", "總負債", "負債比", "流動資產", "流動負債", "每股盈餘(EPS)", "營業活動淨現金流"]
         
         for item_name in order:
-            if parsed_data[item_name]: # 如果該項目有資料
+            if parsed_data[item_name]:
                 row_dict = {"項目": item_name}
-                row_dict.update(parsed_data[item_name]) # 把所有季度的 Key-Value 塞進去
+                row_dict.update(parsed_data[item_name])
                 formatted_list.append(row_dict)
             else:
-                # 即使沒資料也要留一個空行，維持格式一致
                 formatted_list.append({"項目": item_name})
 
-        # 加入來源標記
         formatted_list.append({"項目": "資料來源", "說明": "FinMind (興櫃備援)"})
-
         return formatted_list
 
     except Exception as e:
@@ -263,7 +255,7 @@ def fetch_and_upload_data(stock_code, stock_name_tw=None, market_type="上市"):
             
             if fm_data_list:
                 source_used = "FinMind"
-                formatted_data = fm_data_list # 直接使用 FinMind 整理好的 List
+                formatted_data = fm_data_list
             else:
                 return False, f"❌ 無數據跳過: {stock_name_tw}"
         else:
@@ -355,14 +347,14 @@ def extract_value(df, date_idx, target_name, mapping):
 tab1, tab2 = st.tabs(["🔍 補漏監控中心", "📝 單筆手動"])
 
 with tab1:
-    st.markdown("### 📉 缺漏名單補足系統 (V10.0)")
+    st.markdown("### 📉 缺漏名單補足系統 (V10.1)")
     
     col1, col2 = st.columns(2)
     with col1:
         if st.button("🔄 1. 掃描缺漏名單", type="primary"):
-            with st.spinner("正在比對中..."):
+            with st.spinner("正在比對中 (讀取清單可能需要 10-20 秒，請稍候)..."):
                 full_df = get_all_tw_companies()
-                db_codes = get_existing_codes()
+                db_codes = get_existing_codes() 
                 
                 if not full_df.empty:
                     full_df['code_str'] = full_df['代號'].astype(str).str.strip()
