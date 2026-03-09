@@ -13,8 +13,8 @@ from requests.packages.urllib3.exceptions import InsecureRequestWarning
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 # --- 1. 初始化設定 ---
-st.set_page_config(page_title="富邦 D&O 補漏採集器 (V22.0 增量更新版)", layout="wide", page_icon="🛡️")
-st.title("🛡️ D&O 智能核保 - 缺漏資料補足系統 (V22.0 增量更新版)")
+st.set_page_config(page_title="富邦 D&O 補漏採集器 (V23.0 智能全庫版)", layout="wide", page_icon="🛡️")
+st.title("🛡️ D&O 智能核保 - 缺漏資料補足系統 (V23.0 智能全庫版)")
 
 # 讀取 Supabase 設定
 SUPABASE_URL = os.getenv("SUPABASE_URL") or st.secrets.get("SUPABASE_URL")
@@ -117,7 +117,7 @@ def fetch_finmind_data_history(stock_code):
             target_id = override_id if override_id else stock_code
             params = {"dataset": dataset_name, "data_id": target_id, "start_date": start_date}
             try:
-                time.sleep(1.5) # 🛡️ 防護機制：每次呼叫停 1.5 秒
+                time.sleep(1.5) # 🛡️ 防護機制
                 res = requests.get(base_url, params=params, headers=headers, timeout=5)
                 json_data = res.json()
                 if json_data.get('msg') == 'success': return json_data.get('data', [])
@@ -167,7 +167,10 @@ def fetch_finmind_data_history(stock_code):
                     elif taiex_return < -0.05 and stock_return > 0.10: is_divergent = "明顯背離(強於大盤)"
 
                     stock_volatility_results.append({
-                        "年度": str(year), "高點": float(round(row['High'], 1)), "低點": float(round(row['Low'], 1)), "走勢評估": is_divergent
+                        "年度": str(year), 
+                        "高點": round(float(row['High']), 1), 
+                        "低點": round(float(row['Low']), 1), 
+                        "走勢評估": is_divergent
                     })
 
         if data_rev:
@@ -355,30 +358,18 @@ def fetch_and_update_price_only(stock_code):
 
             stock_volatility_results.append({
                 "年度": str(year),
-                "高點": float(round(row['High'], 1)),
-                "低點": float(round(row['Low'], 1)),
+                "高點": round(float(row['High']), 1),
+                "低點": round(float(row['Low']), 1),
                 "走勢評估": is_divergent
             })
 
         # 4. 🚀 增量合併：把新股價貼到舊財報後面
-        # 先把舊的股價區塊刪掉 (如果有重複執行的話)
         new_financial_data = [item for item in existing_data if item.get("項目") != "近三年股價與大盤"]
-        
-        # 掛上最新算好的股價區塊
-        new_financial_data.append({
-            "項目": "近三年股價與大盤",
-            "股價分析數據": stock_volatility_results
-        })
+        new_financial_data.append({"項目": "近三年股價與大盤", "股價分析數據": stock_volatility_results})
 
-        # 存回資料庫
-        payload = {
-            "code": stock_code,
-            "name": final_name,
-            "financial_data": new_financial_data,
-            "updated_at": datetime.now().isoformat()
-        }
+        payload = {"code": stock_code, "name": final_name, "financial_data": new_financial_data, "updated_at": datetime.now().isoformat()}
         supabase.table("underwriting_cache").upsert(payload).execute()
-        return True, f"⚡ 股價增量更新成功: {final_name} (省下 66% API 額度)"
+        return True, f"⚡ 股價增量更新成功: {final_name}"
 
     except Exception as e:
         return False, f"❌ 增量更新失敗: {str(e)}"
@@ -438,6 +429,40 @@ with tab2:
                 st.warning(f"發現 {len(repair_list)} 家。")
                 st.dataframe(st.session_state.repair_df)
             else: st.success("資料庫品質良好。")
+            
+    st.markdown("---")
+    st.markdown("### ⚡ 全庫股價增量大補丸 (Smart Batch)")
+    st.info("💡 系統會自動掃描，**自動跳過已經有股價的公司**。若中斷，可隨時按鈕接續進度！")
+    
+    if st.button("🚀 一鍵補齊所有公司股價"):
+        with st.spinner("讀取全庫資料中..."):
+            all_data = get_all_db_data()
+            total = len(all_data)
+            
+            missing_price_list = []
+            for item in all_data:
+                fdata = item.get('financial_data', [])
+                if isinstance(fdata, list):
+                    has_price = any(row.get("項目") == "近三年股價與大盤" for row in fdata if isinstance(row, dict))
+                    if not has_price:
+                        missing_price_list.append(str(item['code']))
+            
+        if not missing_price_list:
+            st.success(f"🎉 太棒了！全庫 {total} 家公司都已具備股價資料，無需更新。")
+        else:
+            st.warning(f"🔍 掃描完畢：共 {total} 家公司，有 {len(missing_price_list)} 家需要補足股價。")
+            p_bar = st.progress(0)
+            status = st.empty()
+            success_cnt = 0
+            
+            for i, code in enumerate(missing_price_list):
+                status.text(f"⏳ 正在補足: {code} ({i+1}/{len(missing_price_list)})...")
+                ok, msg = fetch_and_update_price_only(code)
+                if ok: 
+                    success_cnt += 1
+                p_bar.progress((i+1)/len(missing_price_list))
+                
+            st.success(f"✅ 批次更新完成！成功為 {success_cnt} 家公司補上股價。")
 
 with tab3:
     st.markdown("### 🕵️ 深度診斷 (Debug)")
