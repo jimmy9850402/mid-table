@@ -13,8 +13,8 @@ from requests.packages.urllib3.exceptions import InsecureRequestWarning
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 # --- 1. 初始化設定 ---
-st.set_page_config(page_title="富邦 D&O 補漏採集器 (V20.0)", layout="wide", page_icon="🛡️")
-st.title("🛡️ D&O 智能核保 - 缺漏資料補足系統 (營收核彈版)")
+st.set_page_config(page_title="富邦 D&O 補漏採集器 (V21.0 股價波動版)", layout="wide", page_icon="🛡️")
+st.title("🛡️ D&O 智能核保 - 缺漏資料補足系統 (V21.0 股價波動版)")
 
 # 讀取 Supabase 設定
 SUPABASE_URL = os.getenv("SUPABASE_URL") or st.secrets.get("SUPABASE_URL")
@@ -105,19 +105,20 @@ def date_to_roc_quarter(date_str):
         return "未知季度"
 
 def get_quarter_from_date(date_obj):
-    """回傳 (年份, 季度) tuple"""
     return (date_obj.year, (date_obj.month - 1) // 3 + 1)
 
-# --- 🔥 FinMind 救援投手 (V20 營收核彈版) ---
+# --- 🔥 FinMind 救援投手 (V21 加入股價波動與大盤比較) ---
 def fetch_finmind_data_history(stock_code):
     try:
+        # 抓取近三年資料 (約 1095 天)
         start_date = (datetime.now() - timedelta(days=1095)).strftime('%Y-%m-%d')
         base_url = "https://api.finmindtrade.com/api/v4/data"
         token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJkYXRlIjoiMjAyNi0wMi0wNiAxNDoxNToxMSIsInVzZXJfaWQiOiJqaW1teTk4NTA0MDIiLCJlbWFpbCI6IjExMDI1NTAyNEBnLm5jY3UuZWR1LnR3IiwiaXAiOiIyMjMuMTM3LjEwMC4xMjgifQ.2ou0rtCaMqV7XXPBh28jGWFJ7_4EQrtr2CdhNQ5YznI"
         headers = {"Authorization": f"Bearer {token}"}
 
-        def get_fm_dataset(dataset_name):
-            params = {"dataset": dataset_name, "data_id": stock_code, "start_date": start_date}
+        def get_fm_dataset(dataset_name, override_id=None):
+            target_id = override_id if override_id else stock_code
+            params = {"dataset": dataset_name, "data_id": target_id, "start_date": start_date}
             try:
                 res = requests.get(base_url, params=params, headers=headers, timeout=5)
                 json_data = res.json()
@@ -125,17 +126,68 @@ def fetch_finmind_data_history(stock_code):
             except: pass
             return []
 
+        # 1. 原有財務資料抓取
         data_income = get_fm_dataset("TaiwanStockFinancialStatements")
         data_balance = get_fm_dataset("TaiwanStockBalanceSheet")
         data_cash = get_fm_dataset("TaiwanStockCashFlowsStatement")
         data_rev = get_fm_dataset("TaiwanStockMonthRevenue")
 
-        if not any([data_income, data_balance, data_cash, data_rev]): return None
+        # 🌟 2. 新增：抓取股價與大盤資料 (TaiwanStockPrice)
+        data_stock_price = get_fm_dataset("TaiwanStockPrice")
+        data_taiex_price = get_fm_dataset("TaiwanStockPrice", override_id="TAIEX")
+
+        if not any([data_income, data_balance, data_cash, data_rev, data_stock_price]): return None
 
         quarter_buckets = {}
-        monthly_rev_map = {} # 用來存月營收： {(year, month): value}
+        monthly_rev_map = {} 
+        stock_volatility_results = [] 
 
-        # --- 0. 預處理月營收 ---
+        # 🌟 3. 新增：股價與大盤背離計算邏輯
+        if data_stock_price:
+            df_stock = pd.DataFrame(data_stock_price)
+            if not df_stock.empty and 'date' in df_stock.columns:
+                df_stock['date'] = pd.to_datetime(df_stock['date'])
+                df_stock['Year'] = df_stock['date'].dt.year
+                
+                stock_yearly = df_stock.groupby('Year').agg(
+                    High=('max', 'max'),
+                    Low=('min', 'min'),
+                    Close_Last=('close', 'last'),
+                    Close_First=('close', 'first')
+                ).tail(3)
+
+                taiex_yearly_returns = {}
+                if data_taiex_price:
+                    df_taiex = pd.DataFrame(data_taiex_price)
+                    if not df_taiex.empty:
+                        df_taiex['date'] = pd.to_datetime(df_taiex['date'])
+                        df_taiex['Year'] = df_taiex['date'].dt.year
+                        taiex_yearly = df_taiex.groupby('Year').agg(
+                            Close_Last=('close', 'last'),
+                            Close_First=('close', 'first')
+                        ).tail(3)
+                        for year, row in taiex_yearly.iterrows():
+                            taiex_yearly_returns[year] = (row['Close_Last'] - row['Close_First']) / row['Close_First']
+
+                for year, row in stock_yearly.iterrows():
+                    stock_return = (row['Close_Last'] - row['Close_First']) / row['Close_First']
+                    taiex_return = taiex_yearly_returns.get(year, 0)
+                    
+                    is_divergent = "大致相符"
+                    if taiex_return > 0.05 and stock_return < -0.10:
+                        is_divergent = "明顯背離(弱於大盤)"
+                    elif taiex_return < -0.05 and stock_return > 0.10:
+                        is_divergent = "明顯背離(強於大盤)"
+
+                    # 🌟 已經加上 float() 修復 JSON 報錯問題！
+                    stock_volatility_results.append({
+                        "年度": str(year),
+                        "高點": float(round(row['High'], 1)),
+                        "低點": float(round(row['Low'], 1)),
+                        "走勢評估": is_divergent
+                    })
+
+        # --- 以下為財務資料整理邏輯 ---
         if data_rev:
             for row in data_rev:
                 try:
@@ -143,7 +195,6 @@ def fetch_finmind_data_history(stock_code):
                     monthly_rev_map[(dt.year, dt.month)] = row['revenue']
                 except: pass
 
-        # 輔助：從月營收計算季營收
         def calculate_quarterly_rev(year, quarter):
             months = []
             if quarter == 1: months = [1, 2, 3]
@@ -157,9 +208,7 @@ def fetch_finmind_data_history(stock_code):
                 if (year, m) in monthly_rev_map:
                     total += monthly_rev_map[(year, m)]
                     count += 1
-            # 只要有抓到任一個月的資料，就算數 (興櫃有時候會缺月)
-            if count > 0:
-                return total
+            if count > 0: return total
             return None
 
         def add_candidate(date_str, category, key, value):
@@ -168,10 +217,8 @@ def fetch_finmind_data_history(stock_code):
                 quarter_buckets[q_str] = {
                     "EPS_Candidates": {}, "Rev_Candidates": {}, "CF_Candidates": {},
                     "Assets": None, "Liabs": None, "CurAssets": None, "CurLiabs": None,
-                    "DateObj": datetime.strptime(date_str, '%Y-%m-%d') # 存日期物件以便計算
+                    "DateObj": datetime.strptime(date_str, '%Y-%m-%d') 
                 }
-            
-            # 更新日期物件，保持該季度最新的日期
             curr_dt = datetime.strptime(date_str, '%Y-%m-%d')
             if curr_dt > quarter_buckets[q_str]["DateObj"]:
                 quarter_buckets[q_str]["DateObj"] = curr_dt
@@ -184,29 +231,15 @@ def fetch_finmind_data_history(stock_code):
             elif category == "CurAssets": quarter_buckets[q_str]["CurAssets"] = value
             elif category == "CurLiabs": quarter_buckets[q_str]["CurLiabs"] = value
 
-        # --- A. EPS ---
         if data_income:
             eps_keys = ['EPS', 'BasicEarningsPerShare', 'EarningsPerShare', 'NetIncomePerShare']
+            rev_keys = ['OperatingRevenue', 'Revenue', 'TotalOperatingRevenue', 'NetRevenue', 'SalesRevenue', 'NetSales', 'InterestIncome', 'InsuranceRevenue', 'GrossProfit']
             for row in data_income:
                 if row['type'] in eps_keys:
                     add_candidate(row['date'], "EPS", row['type'], row['value'])
-
-        # --- B. 營收 (季報) ---
-        if data_income:
-            rev_keys = [
-                'OperatingRevenue', 'Revenue', 'TotalOperatingRevenue', 
-                'NetRevenue', 'SalesRevenue', 'NetSales',
-                'InterestIncome', 'InsuranceRevenue', 'GrossProfit'
-            ]
-            for row in data_income:
-                # 關鍵字命中
-                if row['type'] in rev_keys:
-                    add_candidate(row['date'], "Rev", row['type'], row['value'])
-                # 模糊命中 (包含 Revenue 且非營業外)
-                elif "Revenue" in row['type'] and "Non" not in row['type']:
+                if row['type'] in rev_keys or ("Revenue" in row['type'] and "Non" not in row['type']):
                     add_candidate(row['date'], "Rev", row['type'], row['value'])
         
-        # --- C. 資產負債 ---
         if data_balance:
             for row in data_balance:
                 t, d, v = row['type'], row['date'], row['value']
@@ -215,14 +248,12 @@ def fetch_finmind_data_history(stock_code):
                 if t in ['CurrentAssets', 'TotalCurrentAssets', 'AssetsCurrent']: add_candidate(d, "CurAssets", t, v)
                 if t in ['CurrentLiabilities', 'TotalCurrentLiabilities', 'LiabilitiesCurrent']: add_candidate(d, "CurLiabs", t, v)
 
-        # --- D. 現金流 ---
         if data_cash:
             cf_keys = ['NetCashInflowFromOperatingActivities', 'CashFlowsFromOperatingActivities', 'CashFlowFromOperatingActivities']
             for row in data_cash:
                 if row['type'] in cf_keys:
                     add_candidate(row['date'], "CF", row['type'], row['value'])
 
-        # --- E. 優先級解析 (Resolution) ---
         sorted_quarters = sorted(quarter_buckets.keys(), reverse=True)[:6]
         final_struct = {
             "營業收入": {}, "每股盈餘(EPS)": {}, "總資產": {}, "總負債": {},
@@ -235,41 +266,31 @@ def fetch_finmind_data_history(stock_code):
 
         for q in sorted_quarters:
             bucket = quarter_buckets[q]
-
-            # 1. EPS
             for p_key in EPS_PRIORITY:
                 if p_key in bucket["EPS_Candidates"]:
                     final_struct["每股盈餘(EPS)"][q] = f"{bucket['EPS_Candidates'][p_key]:.2f}"
                     break
             
-            # 2. 營收 (核彈級邏輯：季報 -> 月報加總)
             found_rev = False
-            # (1) 先查季報 VIP 名單
             for p_key in REV_PRIORITY:
                 if p_key in bucket["Rev_Candidates"]:
                     final_struct["營業收入"][q] = f"{int(bucket['Rev_Candidates'][p_key]/1000):,}"
                     found_rev = True
                     break
             
-            # (2) 若季報沒中，啟動「月營收加總」
             if not found_rev:
-                # 取得該季度的年份與季別
                 d_obj = bucket["DateObj"]
                 y, q_num = get_quarter_from_date(d_obj)
-                
-                # 計算
                 calc_rev = calculate_quarterly_rev(y, q_num)
                 if calc_rev is not None:
                     final_struct["營業收入"][q] = f"{int(calc_rev/1000):,} (月加總)"
                     found_rev = True
 
-            # 3. 現金流
             for p_key in CF_PRIORITY:
                 if p_key in bucket["CF_Candidates"]:
                     final_struct["營業活動淨現金流"][q] = f"{int(bucket['CF_Candidates'][p_key]/1000):,}"
                     break
             
-            # 4. 其他
             if bucket["Assets"]: 
                 final_struct["總資產"][q] = f"{int(bucket['Assets']/1000):,}"
                 if bucket["Liabs"]:
@@ -279,7 +300,6 @@ def fetch_finmind_data_history(stock_code):
             if bucket["CurAssets"]: final_struct["流動資產"][q] = f"{int(bucket['CurAssets']/1000):,}"
             if bucket["CurLiabs"]: final_struct["流動負債"][q] = f"{int(bucket['CurLiabs']/1000):,}"
 
-        # 月營收
         if data_rev:
             rows = sorted(data_rev, key=lambda x: x['date'], reverse=True)
             for row in rows[:8]:
@@ -296,7 +316,14 @@ def fetch_finmind_data_history(stock_code):
             else:
                 formatted_list.append({"項目": item_name})
         
-        formatted_list.append({"項目": "資料來源", "說明": "FinMind (興櫃備援)"})
+        # 🌟 4. 將股價波動資料附掛在 JSON 結構最後
+        if stock_volatility_results:
+            formatted_list.append({
+                "項目": "近三年股價與大盤",
+                "股價分析數據": stock_volatility_results
+            })
+
+        formatted_list.append({"項目": "資料來源", "說明": "FinMind (綜合財報與股價)"})
         return formatted_list
 
     except Exception as e:
@@ -313,68 +340,14 @@ def fetch_and_upload_data(stock_code, stock_name_tw=None, market_type="上市", 
     source_used = "yfinance"
 
     try:
-        if force_finmind:
-             fm_data_list = fetch_finmind_data_history(stock_code)
-             if fm_data_list:
-                 source_used = "FinMind (強制修補)"
-                 formatted_data = fm_data_list
-             else:
-                 return False, f"❌ FinMind 暫無資料: {stock_name_tw}"
+        # 強制使用 FinMind 以確保同時拿到財報與股價資料
+        fm_data_list = fetch_finmind_data_history(stock_code)
+
+        if fm_data_list:
+             source_used = "FinMind (全面接管)"
+             formatted_data = fm_data_list
         else:
-            q_bs = stock.quarterly_balance_sheet
-            q_is = stock.quarterly_financials
-            
-            if q_bs.empty or q_is.empty:
-                fm_data_list = fetch_finmind_data_history(stock_code)
-                if fm_data_list:
-                    source_used = "FinMind"
-                    formatted_data = fm_data_list
-                else:
-                    return False, f"❌ 無數據跳過: {stock_name_tw}"
-            else:
-                q_cf = stock.quarterly_cashflow 
-                df_q = pd.concat([q_is.T, q_bs.T, q_cf.T], axis=1)
-                df_q = df_q.loc[:, ~df_q.columns.duplicated()]
-                df_q.index = pd.to_datetime(df_q.index)
-                df_q_sorted = df_q.sort_index(ascending=False).head(12)
-
-                a_bs = stock.balance_sheet
-                a_is = stock.financials
-                a_cf = stock.cashflow
-                df_a_sorted = pd.DataFrame()
-                if not a_is.empty:
-                    df_a = pd.concat([a_is.T, a_bs.T, a_cf.T], axis=1)
-                    df_a = df_a.loc[:, ~df_a.columns.duplicated()]
-                    df_a.index = pd.to_datetime(df_a.index)
-                    df_a_sorted = df_a.sort_index(ascending=False).head(5)
-
-                mapping = {
-                    "Total Revenue": "營業收入", "Operating Revenue": "營業收入",
-                    "Total Assets": "總資產",
-                    "Total Liabilities Net Minority Interest": "總負債", "Total Liabilities": "總負債",
-                    "Current Assets": "流動資產", "Current Liabilities": "流動負債",
-                    "Basic EPS": "每股盈餘(EPS)",
-                    "Operating Cash Flow": "營業活動淨現金流", 
-                    "Total Cash From Operating Activities": "營業活動淨現金流", 
-                    "Cash Flow From Continuing Operating Activities": "營業活動淨現金流"
-                }
-                
-                target_items = ["營業收入", "總資產", "負債比", "流動資產", "流動負債", "每股盈餘(EPS)", "營業活動淨現金流"]
-
-                for target_name in target_items:
-                    row_dict = {"項目": target_name}
-                    for date_idx in df_q_sorted.index:
-                        key_name = date_to_roc_quarter(date_idx)
-                        val = extract_value(df_q_sorted, date_idx, target_name, mapping)
-                        row_dict[key_name] = val
-                    
-                    if not df_a_sorted.empty:
-                        for date_idx in df_a_sorted.index:
-                            key_name = date_to_roc_year(date_idx)
-                            val = extract_value(df_a_sorted, date_idx, target_name, mapping)
-                            row_dict[key_name] = val
-                    
-                    formatted_data.append(row_dict)
+             return False, f"❌ 查無資料 (可能無財報或股價): {stock_name_tw}"
 
         final_name = stock_name_tw if stock_name_tw else stock.info.get('longName', stock_code)
         payload = {
@@ -388,28 +361,6 @@ def fetch_and_upload_data(stock_code, stock_name_tw=None, market_type="上市", 
 
     except Exception as e:
         return False, str(e)
-
-def extract_value(df, date_idx, target_name, mapping):
-    if target_name == "負債比":
-        try:
-            liab = df.loc[date_idx].get("Total Liabilities Net Minority Interest") or df.loc[date_idx].get("Total Liabilities")
-            assets = df.loc[date_idx].get("Total Assets")
-            if liab and assets: return f"{(liab / assets) * 100:.2f}%"
-        except: pass
-        return "-"
-    else:
-        found_val = None
-        for eng_col, ch_col in mapping.items():
-            if ch_col == target_name and eng_col in df.columns:
-                val = df.loc[date_idx, eng_col]
-                if pd.notna(val): found_val = val; break
-        
-        if found_val is not None:
-            if target_name != "每股盈餘(EPS)":
-                try: return f"{int(found_val / 1000):,}"
-                except: return "-"
-            else: return f"{found_val:.2f}"
-    return "-"
 
 # --- 5. UI 介面 ---
 tab1, tab2, tab3, tab4 = st.tabs(["🔍 補漏監控", "🚑 資料修補 (Fix)", "🕵️ 深度診斷", "📝 單筆手動"])
@@ -443,7 +394,7 @@ with tab1:
             st.success(f"補足 {cnt} 家")
 
 with tab2:
-    st.markdown("### 🚑 興櫃資料修補中心 (V20.0 營收核彈)")
+    st.markdown("### 🚑 興櫃資料修補中心 (V21.0 股價波動)")
     if st.button("🔍 1. 掃描需修補名單"):
         with st.spinner("分析資料庫品質中..."):
             all_data = get_all_db_data()
@@ -505,20 +456,6 @@ with tab3:
                     st.write("#### 資產負債表所有欄位 (Keys):")
                     st.code(list(df['type'].unique()))
                 else: st.warning("資產負債表無資料")
-
-            res = requests.get(base_url, params={"dataset": "TaiwanStockFinancialStatements", "data_id": debug_code, "start_date": start_date}, headers=headers)
-            if res.json().get('msg') == 'success':
-                df = pd.DataFrame(res.json().get('data', []))
-                if not df.empty:
-                    st.write("#### 損益表所有欄位 (Keys):")
-                    st.code(list(df['type'].unique()))
-            
-            res = requests.get(base_url, params={"dataset": "TaiwanStockCashFlowsStatement", "data_id": debug_code, "start_date": start_date}, headers=headers)
-            if res.json().get('msg') == 'success':
-                df = pd.DataFrame(res.json().get('data', []))
-                if not df.empty:
-                    st.write("#### 現金流量表所有欄位 (Keys):")
-                    st.code(list(df['type'].unique()))
 
 with tab4:
     st.markdown("### 📝 手動單筆查詢")
