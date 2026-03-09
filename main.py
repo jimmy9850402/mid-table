@@ -58,24 +58,19 @@ async def analyze(request: Request):
         all_quarters = sorted([k for k in all_keys if "Q" in k], reverse=True)
         
         # 2. 【過濾邏輯】找出「營業收入」不是空值的季度
-        # 先找到營收那一列
         rev_row = next((r for r in raw_rows if "營業收入" in r["項目"]), None)
         
         valid_quarters = []
         if rev_row:
             for q in all_quarters:
                 val = str(rev_row.get(q, "-"))
-                # 如果營收不是 -, 0, N/A, nan，才算有效季度
                 if val not in ["-", "0", "N/A", "None", "nan"]:
                     valid_quarters.append(q)
         else:
-            # 萬一沒抓到營收列，就只好全顯 (避免報錯)
             valid_quarters = all_quarters
 
         # 3. 只取「有效季度」的前 5 個
         display_quarters = valid_quarters[:5]
-        
-        # ------------------------------------------
         
         # 4. 處理年度 (Years) - 指定 2023(112) 與 2024(113)
         target_years_roc = [112, 113]
@@ -113,11 +108,9 @@ async def analyze(request: Request):
             vals = []
             
             if row_data:
-                # A. 填入有效季度
                 for q in display_quarters:
                     vals.append(str(row_data.get(q, "-")))
                 
-                # B. 填入年度
                 for yr in target_years_roc:
                     vals.append(get_year_val(yr, row_data))
             else:
@@ -128,12 +121,43 @@ async def analyze(request: Request):
         final_markdown = f"{header_str}\n{sep_str}\n" + "\n".join(md_rows)
         
         # ==========================================
+        # 🌟 新增邏輯：抓取並組合「股價波動資訊」Markdown
+        # ==========================================
+        stock_row = next((r for r in raw_rows if r.get("項目") == "近三年股價與大盤"), None)
+        if stock_row and "股價分析數據" in stock_row:
+            stock_data = stock_row["股價分析數據"]
+            
+            # 建立股價表格的 Markdown
+            vol_header = "\n\n### 四、股價波動資訊與大盤比較\n| 年度 | 高點 | 低點 | 走勢評估 |\n| :--- | :--- | :--- | :--- |\n"
+            vol_rows = []
+            divergence_summaries = [] # 收集背離說明
+            
+            for item in stock_data:
+                # 組合表格的每一列
+                vol_rows.append(f"| {item['年度']} | {item['高點']} | {item['低點']} | {item['走勢評估']} |")
+                
+                # 若有背離，準備寫入摘要說明
+                if "背離" in item['走勢評估']:
+                    divergence_summaries.append(f"({item['年度']}) 走勢{item['走勢評估']}。")
+            
+            # 組合最終的股價 Markdown 區塊
+            stock_markdown = vol_header + "\n".join(vol_rows)
+            
+            # 加上摘要文字
+            if divergence_summaries:
+                stock_markdown += f"\n\n波動摘要說明：發現明顯背離。請核保人員留意以下年度：" + " ".join(divergence_summaries)
+            else:
+                stock_markdown += "\n\n波動摘要說明：近三年走勢與大盤大致相符。"
+                
+            # 將股價區塊拼接到原本的 final_markdown 後面
+            final_markdown += stock_markdown
+
+        # ==========================================
         # ⚖️ 核保判定邏輯 (Group A check)
         # ==========================================
         conclusion = "⚠️ 無法判定"
         try:
             if rev_row and display_quarters:
-                # 抓取「有效最新季」的營收來判斷
                 latest_q = display_quarters[0]
                 val_str = str(rev_row.get(latest_q, "0")).replace(",", "").split(" ")[0]
                 val = float(val_str)
