@@ -13,8 +13,8 @@ from requests.packages.urllib3.exceptions import InsecureRequestWarning
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 # --- 1. 初始化設定 ---
-st.set_page_config(page_title="富邦 D&O 補漏採集器 (V24.0 完整零死角版)", layout="wide", page_icon="🛡️")
-st.title("🛡️ D&O 智能核保 - 缺漏資料補足系統 (V24.0 完整零死角版)")
+st.set_page_config(page_title="富邦 D&O 補漏採集器 (V25.0 異常清洗版)", layout="wide", page_icon="🛡️")
+st.title("🛡️ D&O 智能核保 - 缺漏資料補足系統 (V25.0 異常清洗版)")
 
 # 讀取 Supabase 設定
 SUPABASE_URL = os.getenv("SUPABASE_URL") or st.secrets.get("SUPABASE_URL")
@@ -39,8 +39,6 @@ def get_all_tw_companies():
     session = requests.Session()
     session.headers.update({
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7'
     })
 
     try:
@@ -59,8 +57,7 @@ def get_all_tw_companies():
             
             target_cols = ['代號', '名稱', '市場別', '產業別', '上市日']
             for col in target_cols:
-                if col not in df_stock.columns:
-                    df_stock[col] = "-"
+                if col not in df_stock.columns: df_stock[col] = "-"
             
             clean_df = df_stock[target_cols]
             clean_df = clean_df[clean_df['代號'].str.match(r'^\d{4}$')]
@@ -144,7 +141,6 @@ def fetch_finmind_data_history(stock_code):
                 df_stock['date'] = pd.to_datetime(df_stock['date'])
                 df_stock['Year'] = df_stock['date'].dt.year
                 
-                # 🛡️ 修復：只取有交易、數值大於 0 的日子
                 df_clean_stock = df_stock[df_stock['close'] > 0].copy()
                 
                 if not df_clean_stock.empty:
@@ -173,7 +169,6 @@ def fetch_finmind_data_history(stock_code):
                         if taiex_return > 0.05 and stock_return < -0.10: is_divergent = "明顯背離(弱於大盤)"
                         elif taiex_return < -0.05 and stock_return > 0.10: is_divergent = "明顯背離(強於大盤)"
 
-                        # 🌟 確保文字化小數點一位
                         stock_volatility_results.append({
                             "年度": str(year), 
                             "高點": f"{float(row['High']):.1f}", 
@@ -280,7 +275,6 @@ def fetch_finmind_data_history(stock_code):
                 row_dict = {"項目": item_name}; row_dict.update(final_struct[item_name]); formatted_list.append(row_dict)
             else: formatted_list.append({"項目": item_name})
         
-        # 🌟 附掛股價資料
         if stock_volatility_results: formatted_list.append({"項目": "近三年股價與大盤", "股價分析數據": stock_volatility_results})
         formatted_list.append({"項目": "資料來源", "說明": "FinMind (綜合財報與股價)"})
         return formatted_list
@@ -307,7 +301,6 @@ def fetch_and_upload_data(stock_code, stock_name_tw=None, market_type="上市", 
 # ==========================================
 def fetch_and_update_price_only(stock_code):
     try:
-        # 1. 先去 Supabase 看看有沒有這家公司的舊財報
         res = supabase.table("underwriting_cache").select("*").eq("code", stock_code).execute()
         if not res.data:
             return False, f"❌ 資料庫中找不到 {stock_code}，請先執行「完整抓取」。"
@@ -315,7 +308,6 @@ def fetch_and_update_price_only(stock_code):
         existing_data = res.data[0].get('financial_data', [])
         final_name = res.data[0].get('name', stock_code)
 
-        # 2. 啟動 FinMind 股價專門撈取
         start_date = (datetime.now() - timedelta(days=1095)).strftime('%Y-%m-%d')
         base_url = "https://api.finmindtrade.com/api/v4/data"
         token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJkYXRlIjoiMjAyNi0wMi0wNiAxNDoxNToxMSIsInVzZXJfaWQiOiJqaW1teTk4NTA0MDIiLCJlbWFpbCI6IjExMDI1NTAyNEBnLm5jY3UuZWR1LnR3IiwiaXAiOiIyMjMuMTM3LjEwMC4xMjgifQ.2ou0rtCaMqV7XXPBh28jGWFJ7_4EQrtr2CdhNQ5YznI"
@@ -325,25 +317,22 @@ def fetch_and_update_price_only(stock_code):
             target_id = override_id if override_id else stock_code
             params = {"dataset": dataset_name, "data_id": target_id, "start_date": start_date}
             try:
-                time.sleep(1.5) # 🛡️ 防護機制
+                time.sleep(1.5)
                 r = requests.get(base_url, params=params, headers=headers, timeout=5)
                 if r.json().get('msg') == 'success': return r.json().get('data', [])
             except: pass
             return []
 
-        # 🎯 只抓這兩個！
         data_stock_price = get_fm_dataset_price("TaiwanStockPrice")
         data_taiex_price = get_fm_dataset_price("TaiwanStockPrice", override_id="TAIEX")
 
         if not data_stock_price:
             return False, f"❌ 抓不到 {stock_code} 的歷史股價"
 
-        # 3. 計算高低點與背離
         df_stock = pd.DataFrame(data_stock_price)
         df_stock['date'] = pd.to_datetime(df_stock['date'])
         df_stock['Year'] = df_stock['date'].dt.year
         
-        # 🛡️ 關鍵修復：排除掉 close <= 0 的異常數據
         df_clean_stock = df_stock[df_stock['close'] > 0].copy()
         
         if df_clean_stock.empty:
@@ -374,7 +363,6 @@ def fetch_and_update_price_only(stock_code):
             if taiex_return > 0.05 and stock_return < -0.10: is_divergent = "明顯背離(弱於大盤)"
             elif taiex_return < -0.05 and stock_return > 0.10: is_divergent = "明顯背離(強於大盤)"
 
-            # 🌟 取小數點第一位並強制轉型為字串
             stock_volatility_results.append({
                 "年度": str(year),
                 "高點": f"{float(row['High']):.1f}",
@@ -382,7 +370,6 @@ def fetch_and_update_price_only(stock_code):
                 "走勢評估": is_divergent
             })
 
-        # 4. 🚀 增量合併：把新股價貼到舊財報後面
         new_financial_data = [item for item in existing_data if item.get("項目") != "近三年股價與大盤"]
         new_financial_data.append({"項目": "近三年股價與大盤", "股價分析數據": stock_volatility_results})
 
@@ -432,7 +419,7 @@ with tab1:
 with tab2:
     st.markdown("### 🚑 興櫃資料修補中心")
     st.warning("⚠️ 批次強制修補非常耗費 API 額度，請謹慎使用。")
-    if st.button("🔍 1. 掃描需修補名單"):
+    if st.button("🔍 1. 掃描需修補名單 (無營收/EPS)"):
         with st.spinner("分析資料庫品質中..."):
             all_data = get_all_db_data()
             repair_list = []
@@ -487,6 +474,59 @@ with tab2:
                 p_bar.progress((i+1)/len(missing_price_list))
                 
             st.success(f"✅ 批次更新完成！成功為 {success_cnt} 家公司補上股價。")
+
+    # 🌟 新增的 0 元清洗工具 🌟
+    st.markdown("---")
+    st.markdown("### 🛠️ 股價異常 (0元) 專項修補工具")
+    st.info("💡 專門掃描並修復股價低點/高點出現 `0.0` 的異常公司。")
+    
+    if st.button("🔍 1. 掃描 0 元異常公司"):
+        with st.spinner("全庫掃描異常數據中..."):
+            all_data = get_all_db_data()
+            zero_price_list = []
+            for item in all_data:
+                fdata = item.get('financial_data', [])
+                if isinstance(fdata, list):
+                    for row in fdata:
+                        if isinstance(row, dict) and row.get("項目") == "近三年股價與大盤":
+                            stock_data = row.get("股價分析數據", [])
+                            has_zero = False
+                            for s_data in stock_data:
+                                try:
+                                    if float(s_data.get("低點", 1)) == 0.0 or float(s_data.get("高點", 1)) == 0.0:
+                                        has_zero = True
+                                        break
+                                except: pass
+                            if has_zero:
+                                zero_price_list.append({"code": item['code'], "name": item['name']})
+                            break
+                            
+            if zero_price_list:
+                st.session_state.zero_price_list = zero_price_list
+                st.warning(f"⚠️ 發現 {len(zero_price_list)} 家公司存在 0 元異常！")
+                st.dataframe(pd.DataFrame(zero_price_list))
+            else:
+                st.success("🎉 太棒了！資料庫中沒有發現股價為 0 的異常公司。")
+                if 'zero_price_list' in st.session_state:
+                    del st.session_state.zero_price_list
+
+    if 'zero_price_list' in st.session_state and st.session_state.zero_price_list:
+        if st.button(f"🚑 2. 一鍵修復這 {len(st.session_state.zero_price_list)} 家公司"):
+            p_bar = st.progress(0)
+            status = st.empty()
+            success_cnt = 0
+            target_list = st.session_state.zero_price_list
+            
+            for i, comp in enumerate(target_list):
+                code = comp['code']
+                status.text(f"⏳ 正在修復: {code} {comp['name']} ({i+1}/{len(target_list)})...")
+                ok, msg = fetch_and_update_price_only(code)
+                if ok: 
+                    success_cnt += 1
+                p_bar.progress((i+1)/len(target_list))
+                
+            st.success(f"✅ 修復完成！成功更新 {success_cnt} 家公司的異常股價。")
+            del st.session_state.zero_price_list
 
 with tab3:
     st.markdown("### 🕵️ 深度診斷 (Debug)")
