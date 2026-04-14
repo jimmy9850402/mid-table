@@ -9,3 +9,5 @@ supabase
 python-dotenv
 requests
 urllib3
+duckduckgo-search
+google-genai
