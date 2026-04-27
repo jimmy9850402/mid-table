@@ -5,6 +5,7 @@ import os
 from datetime import datetime, timedelta
 import time
 import requests
+import io  # 🌟 解決 Pandas read_html 找不到檔案的關鍵套件
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 from duckduckgo_search import DDGS
 from google import genai
@@ -13,8 +14,8 @@ from google import genai
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 # --- 1. 系統初始化 ---
-st.set_page_config(page_title="富邦 D&O 採集引擎 V26.2", layout="wide", page_icon="🛡️")
-st.title("🛡️ D&O 智能核保 - 全庫數據自動補漏系統 (V26.2 權威搜尋版)")
+st.set_page_config(page_title="富邦 D&O 採集引擎 V26.3", layout="wide", page_icon="🛡️")
+st.title("🛡️ D&O 智能核保 - 全庫數據自動補漏系統 (V26.3 權威防護版)")
 
 # 環境變數設定
 SUPABASE_URL = os.getenv("SUPABASE_URL") or st.secrets.get("SUPABASE_URL")
@@ -29,14 +30,14 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 # ==========================================
-# 🤖 核心功能：AI 輿情探勘模組 (多路徑升級版)
+# 🤖 核心功能：AI 輿情探勘模組 (多路徑權威搜尋)
 # ==========================================
 def ai_web_research(company_name):
     if not ai_client: return "⚠️ 未設定 API KEY"
     try:
         search_context = []
         
-        # 🌟 實作多路徑與權威網域搜尋
+        # 🌟 多路徑與權威網域搜尋策略
         queries = [
             f"{company_name} (ADR OR GDR OR 美國存託憑證) site:mops.twse.com.tw OR site:cmoney.tw",
             f"{company_name} (重大訴訟 OR 掏空 OR 內線交易 OR 裁罰)",
@@ -67,25 +68,40 @@ def ai_web_research(company_name):
         return f"⚠️ 探勘異常: {e}"
 
 # ==========================================
-# 📊 數據庫讀取功能
+# 📊 數據庫讀取功能 (升級防爬蟲機制)
 # ==========================================
 @st.cache_data(ttl=3600)
 def get_all_tw_companies():
     sources = [("上市", "2"), ("上櫃", "4"), ("興櫃", "5")]
     all_dfs = []
+    
+    # 🌟 加上瀏覽器偽裝 (User-Agent) 騙過證交所防護
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+    
     for m_name, mode in sources:
         url = f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={mode}"
-        res = requests.get(url, verify=False, timeout=15)
-        res.encoding = 'cp950'
-        df = pd.read_html(res.text)[0]
-        df.columns = df.iloc[0]
-        df = df.iloc[1:]
-        df = df[df['有價證券代號及名稱'].notna()]
-        df_stock = df[df['有價證券代號及名稱'].str.contains('　')].copy()
-        df_stock[['代號', '名稱']] = df_stock['有價證券代號及名稱'].str.split('　', expand=True).iloc[:, :2]
-        df_stock['市場別'] = m_name
-        all_dfs.append(df_stock[['代號', '名稱', '市場別', '產業別']])
-    return pd.concat(all_dfs, ignore_index=True)
+        try:
+            res = requests.get(url, headers=headers, verify=False, timeout=15)
+            res.raise_for_status() 
+            res.encoding = 'cp950'
+            
+            # 🌟 強制轉為 StringIO，避免 pandas 誤認字串為檔案路徑
+            df = pd.read_html(io.StringIO(res.text))[0]
+            
+            df.columns = df.iloc[0]
+            df = df.iloc[1:]
+            df = df[df['有價證券代號及名稱'].notna()]
+            df_stock = df[df['有價證券代號及名稱'].str.contains('　')].copy()
+            df_stock[['代號', '名稱']] = df_stock['有價證券代號及名稱'].str.split('　', expand=True).iloc[:, :2]
+            df_stock['市場別'] = m_name
+            all_dfs.append(df_stock[['代號', '名稱', '市場別', '產業別']])
+        except Exception as e:
+            st.warning(f"⚠️ 讀取 {m_name} 名單時發生異常，已自動跳過: {e}")
+            continue
+            
+    return pd.concat(all_dfs, ignore_index=True) if all_dfs else pd.DataFrame()
 
 def get_db_codes():
     try:
@@ -104,7 +120,7 @@ def process_data(stock_code, stock_name):
         headers = {"Authorization": f"Bearer {token}"}
 
         def fetch(ds):
-            time.sleep(1.1)
+            time.sleep(1.1) # 溫和爬取，避免鎖 IP
             return requests.get(base_url, params={"dataset": ds, "data_id": stock_code, "start_date": lookback}, headers=headers).json().get('data', [])
 
         income = fetch("TaiwanStockFinancialStatements")
@@ -138,8 +154,9 @@ def process_data(stock_code, stock_name):
                 if item == "每股盈餘(EPS)": row[q] = f"{v.get('EPS', 0):.2f}"
             final.append(row)
 
+        # 寫入 AI 探勘結果與時間戳
         final.append({"項目": "AI深度網路探勘(非財務特徵)", "探勘結果": ai_web_research(stock_name)})
-        final.append({"項目": "資料來源", "說明": f"FinMind + AI (更新: {datetime.now().strftime('%m/%d %H:%M')})"})
+        final.append({"項目": "資料來源", "說明": f"FinMind + 智能探勘 (更新: {datetime.now().strftime('%m/%d %H:%M')})"})
         return final
     except: return None
 
@@ -154,7 +171,7 @@ with tab1:
     
     col_a, col_b = st.columns(2)
     if col_a.button("🔄 1. 開始掃描缺漏", type="primary"):
-        with st.spinner("正在掃描全台市場名單..."):
+        with st.spinner("正在掃描全台市場名單 (已啟動防爬蟲偽裝)..."):
             market_df = get_all_tw_companies()
             db_codes = get_db_codes()
             missing = market_df[~market_df['代號'].astype(str).isin(db_codes)].copy()
@@ -189,7 +206,7 @@ with tab2:
     sc = st.text_input("代號", "2330")
     sn = st.text_input("名稱", "台積電")
     if st.button("📥 手動更新此筆"):
-        with st.spinner("抓取中..."):
+        with st.spinner("抓取最新財報與啟動多路徑 AI 探勘中..."):
             res = process_data(sc, sn)
             if res:
                 supabase.table("underwriting_cache").upsert({
