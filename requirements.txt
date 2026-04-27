@@ -11,3 +11,4 @@ requests
 urllib3
 duckduckgo-search
 google-genai
+html5lib
