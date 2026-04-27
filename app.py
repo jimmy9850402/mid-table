@@ -14,7 +14,7 @@ from google import genai
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 # --- 1. 系統初始化 ---
-st.set_page_config(page_title="富邦 D&O 採集引擎 V26.6", layout="wide", page_icon="🛡️")
+st.set_page_config(page_title="富邦 D&O 採集引擎 V26.7", layout="wide", page_icon="🛡️")
 st.title("🛡️ D&O 智能核保 - 數據採集與股價自動評估")
 
 # 環境變數設定
@@ -150,14 +150,15 @@ def process_data(stock_code, stock_name, skip_ai=False):
             for lbl in [q_label, year_label]:
                 if lbl not in bucket: bucket[lbl] = {}
                 t = r.get('type')
-                v = r.get('value', 0)
-                if t in ['OperatingRevenue', 'Revenue']: bucket[lbl]['營收'] = v
-                if t == 'TotalAssets': bucket[lbl]['總資產'] = v
-                if t == 'TotalLiabilities': bucket[lbl]['總負債'] = v
-                if t == 'TotalCurrentAssets': bucket[lbl]['流動資產'] = v
-                if t == 'TotalCurrentLiabilities': bucket[lbl]['流動負債'] = v
-                if t in ['EPS', 'BasicEarningsPerShare']: bucket[lbl]['EPS'] = v
-                if t == 'NetCashFlowsFromUsedInOperatingActivities': bucket[lbl]['營業活動淨現金流'] = v
+                v = r.get('value')
+                if v is not None:  # 防範 API 傳回 null
+                    if t in ['OperatingRevenue', 'Revenue']: bucket[lbl]['營收'] = v
+                    if t == 'TotalAssets': bucket[lbl]['總資產'] = v
+                    if t == 'TotalLiabilities': bucket[lbl]['總負債'] = v
+                    if t == 'TotalCurrentAssets': bucket[lbl]['流動資產'] = v
+                    if t == 'TotalCurrentLiabilities': bucket[lbl]['流動負債'] = v
+                    if t in ['EPS', 'BasicEarningsPerShare']: bucket[lbl]['EPS'] = v
+                    if t == 'NetCashFlowsFromUsedInOperatingActivities': bucket[lbl]['營業活動淨現金流'] = v
 
         items_map = ["營業收入", "總資產", "負債比", "流動資產", "流動負債", "每股盈餘(EPS)", "營業活動淨現金流"]
         final_list = []
@@ -165,15 +166,32 @@ def process_data(stock_code, stock_name, skip_ai=False):
         for item in items_map:
             row = {"項目": item}
             for lbl, vals in bucket.items():
-                if item == "營業收入": row[lbl] = f"{int(vals.get('營收', 0)/1000):,}" if vals.get('營收') else "-"
-                if item == "總資產": row[lbl] = f"{int(vals.get('總資產', 0)/1000):,}" if vals.get('總資產') else "-"
-                if item == "負債比":
-                    if vals.get('總資產'): row[lbl] = f"{(vals['總負債']/vals['總資產'])*100:.2f}%"
-                    else: row[lbl] = "nan%"
-                if item == "流動資產": row[lbl] = f"{int(vals.get('流動資產', 0)/1000):,}" if vals.get('流動資產') else "-"
-                if item == "流動負債": row[lbl] = f"{int(vals.get('流動負債', 0)/1000):,}" if vals.get('流動負債') else "-"
-                if item == "每股盈餘(EPS)": row[lbl] = f"{vals.get('EPS', 0):.2f}" if vals.get('EPS') else "-"
-                if item == "營業活動淨現金流": row[lbl] = f"{int(vals.get('營業活動淨現金流', 0)/1000):,}" if vals.get('營業活動淨現金流') else "-"
+                # 🌟 升級版安全取值：嚴格處理 0 與 None，徹底根絕 KeyError 與除以零
+                if item == "營業收入":
+                    v = vals.get('營收')
+                    row[lbl] = f"{int(v/1000):,}" if v is not None else "-"
+                elif item == "總資產":
+                    v = vals.get('總資產')
+                    row[lbl] = f"{int(v/1000):,}" if v is not None else "-"
+                elif item == "負債比":
+                    ta = vals.get('總資產')
+                    tl = vals.get('總負債')
+                    if ta is not None and tl is not None and ta != 0:
+                        row[lbl] = f"{(tl/ta)*100:.2f}%"
+                    else:
+                        row[lbl] = "nan%"
+                elif item == "流動資產":
+                    v = vals.get('流動資產')
+                    row[lbl] = f"{int(v/1000):,}" if v is not None else "-"
+                elif item == "流動負債":
+                    v = vals.get('流動負債')
+                    row[lbl] = f"{int(v/1000):,}" if v is not None else "-"
+                elif item == "每股盈餘(EPS)":
+                    v = vals.get('EPS')
+                    row[lbl] = f"{v:.2f}" if v is not None else "-"
+                elif item == "營業活動淨現金流":
+                    v = vals.get('營業活動淨現金流')
+                    row[lbl] = f"{int(v/1000):,}" if v is not None else "-"
             final_list.append(row)
 
         stock_data = fetch_stock_analysis(stock_code)
@@ -222,7 +240,6 @@ with tab1:
             
             for i, row in enumerate(m_list.head(batch_count).itertuples()):
                 st_status.text(f"⏳ 正在處理 ({i+1}/{batch_count}): {row.代號} {row.名稱}")
-                # 批次更新預設跑完整深度模式
                 res_data = process_data(row.代號, row.名稱, skip_ai=False)
                 if res_data:
                     supabase.table("underwriting_cache").upsert({
@@ -242,7 +259,6 @@ with tab2:
     col_btn1, col_btn2 = st.columns(2)
 
     with col_btn1:
-        # ✅ 修正完成：改用 use_container_width=True
         if st.button("⚡ 快速更新 (財務及股價)", use_container_width=True):
             with st.spinner("正在極速同步財務指標與股價..."):
                 res = process_data(sc, sn, skip_ai=True)
@@ -255,7 +271,6 @@ with tab2:
                         st.json(res[:2])
 
     with col_btn2:
-        # ✅ 修正完成：改用 use_container_width=True
         if st.button("🔍 深度更新 (含 AI 探勘)", type="primary", use_container_width=True):
             with st.spinner("正在進行完整核保調查 (含網路搜尋)..."):
                 res = process_data(sc, sn, skip_ai=False)
