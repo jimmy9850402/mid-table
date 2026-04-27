@@ -13,8 +13,8 @@ from google import genai
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 # --- 1. 系統初始化 ---
-st.set_page_config(page_title="富邦 D&O 採集引擎 V26.1", layout="wide", page_icon="🛡️")
-st.title("🛡️ D&O 智能核保 - 全庫數據自動補漏系統 (V26.1)")
+st.set_page_config(page_title="富邦 D&O 採集引擎 V26.2", layout="wide", page_icon="🛡️")
+st.title("🛡️ D&O 智能核保 - 全庫數據自動補漏系統 (V26.2 權威搜尋版)")
 
 # 環境變數設定
 SUPABASE_URL = os.getenv("SUPABASE_URL") or st.secrets.get("SUPABASE_URL")
@@ -29,23 +29,42 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 # ==========================================
-# 🤖 核心功能：AI 輿情探勘模組
+# 🤖 核心功能：AI 輿情探勘模組 (多路徑升級版)
 # ==========================================
 def ai_web_research(company_name):
     if not ai_client: return "⚠️ 未設定 API KEY"
     try:
-        query = f"{company_name} (美國員工 OR ADR OR 裁罰 OR 訴訟) 新聞"
         search_context = []
+        
+        # 🌟 實作多路徑與權威網域搜尋
+        queries = [
+            f"{company_name} (ADR OR GDR OR 美國存託憑證) site:mops.twse.com.tw OR site:cmoney.tw",
+            f"{company_name} (重大訴訟 OR 掏空 OR 內線交易 OR 裁罰)",
+            f"{company_name} (美國員工 OR 美國分公司 OR 美國據點)"
+        ]
+        
         with DDGS() as ddgs:
-            results = ddgs.text(query, max_results=5)
-            for r in results: search_context.append(f"標題: {r['title']}\n摘要: {r['body']}")
+            for q in queries:
+                results = ddgs.text(q, max_results=3)
+                for r in results: 
+                    search_context.append(f"來源: {q}\n標題: {r['title']}\n摘要: {r['body']}")
         
         if not search_context: return "✅ 無顯著重大負面與美國風險。"
 
-        prompt = f"你是一位 D&O 核保專家。請根據搜尋結果分析「{company_name}」的美國員工狀況、有無發行 ADR 及近期重大訴訟裁罰。\n搜尋內容：\n" + "\n".join(search_context)
+        context_str = "\n\n".join(search_context)[:10000]
+
+        prompt = f"""
+        你是一位 D&O 核保專家。請根據以下多重來源的搜尋結果，分析「{company_name}」的：
+        1. 有無發行 ADR/GDR 或美國存託憑證？
+        2. 美國員工與據點狀況？
+        3. 近期重大訴訟、裁罰或治理弊案？
+        若查無明確資訊請回答「查無公開資料」，不得編造。
+        \n搜尋內容：\n{context_str}
+        """
         response = ai_client.models.generate_content(model='gemini-2.0-flash', contents=prompt)
         return response.text
-    except: return "⚠️ 探勘超限或忙碌"
+    except Exception as e: 
+        return f"⚠️ 探勘異常: {e}"
 
 # ==========================================
 # 📊 數據庫讀取功能
@@ -79,7 +98,6 @@ def get_db_codes():
 # ==========================================
 def process_data(stock_code, stock_name):
     try:
-        # 設置抓取日期回溯，確保包含最新發布
         lookback = (datetime.now() - timedelta(days=1100)).strftime('%Y-%m-%d')
         base_url = "https://api.finmindtrade.com/api/v4/data"
         token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJkYXRlIjoiMjAyNi0wMi0wNiAxNDoxNToxMSIsInVzZXJfaWQiOiJqaW1teTk4NTA0MDIiLCJlbWFpbCI6IjExMDI1NTAyNEBnLm5jY3UuZWR1LnR3IiwiaXAiOiIyMjMuMTM3LjEwMC4xMjgifQ.2ou0rtCaMqV7XXPBh28jGWFJ7_4EQrtr2CdhNQ5YznI"
@@ -109,7 +127,6 @@ def process_data(stock_code, stock_name):
                 if r['type'] == 'TotalAssets': bucket[q]['總資產'] = r['value']
                 if r['type'] == 'TotalLiabilities': bucket[q]['總負債'] = r['value']
 
-        # 封裝為格式化列表
         final = []
         for item in ["營業收入", "總資產", "總負債", "負債比", "每股盈餘(EPS)"]:
             row = {"項目": item}
@@ -121,7 +138,6 @@ def process_data(stock_code, stock_name):
                 if item == "每股盈餘(EPS)": row[q] = f"{v.get('EPS', 0):.2f}"
             final.append(row)
 
-        # 附加 AI 探勘與時間戳
         final.append({"項目": "AI深度網路探勘(非財務特徵)", "探勘結果": ai_web_research(stock_name)})
         final.append({"項目": "資料來源", "說明": f"FinMind + AI (更新: {datetime.now().strftime('%m/%d %H:%M')})"})
         return final
