@@ -85,12 +85,19 @@ def fetch_stock_analysis(stock_code):
     except: return []
 
 # ==========================================
-# 🕵️ 核心功能：MOPS 舊版後門重訊爬蟲
+# 🕵️ 核心功能：MOPS 舊版後門重訊爬蟲 (搭載高風險智能濾網)
 # ==========================================
 def fetch_mops_detailed_news(stock_code):
     current_roc_year = datetime.now().year - 1911
     target_years = [current_roc_year, current_roc_year - 1, current_roc_year - 2]
     detailed_news = []
+    
+    # 🚨 D&O 核保專屬地雷關鍵字
+    danger_keywords = [
+        "訴訟", "掏空", "辭任", "變動達三分之一", "退票", "終止買賣", 
+        "保留意見", "繼續經營", "虧損", "解任", "調查", "違規", 
+        "異常", "罰鍰", "裁罰", "檢調", "搜索", "扣押"
+    ]
     
     post_url = 'https://mopsov.twse.com.tw/mops/web/ajax_t05st01'
     session = requests.Session()
@@ -156,12 +163,16 @@ def fetch_mops_detailed_news(stock_code):
                             if '主旨' in td_text and i + 1 < len(tds): subject = tds[i+1].get_text().strip()
                             if '說明' in td_text and i + 1 < len(tds): content = tds[i+1].get_text().strip().replace('\n', '').replace('\r', '')
                 
-                detailed_news.append({"日期": codes[3], "主旨": subject, "內文": content})
+                # 第一道防線過濾：只有命中風險字眼才存入
+                if any(keyword in subject or keyword in content for keyword in danger_keywords):
+                    short_content = content[:800] + ("...(內文過長已截斷)" if len(content) > 800 else "")
+                    detailed_news.append({"日期": codes[3], "主旨": subject, "內文": short_content})
         except: continue
+        
     return detailed_news
 
 # ==========================================
-# 📊 數據庫讀取功能 (名單過濾版)
+# 📊 數據庫讀取功能 (升級嚴格過濾版)
 # ==========================================
 @st.cache_data(ttl=3600)
 def get_all_tw_companies():
@@ -176,10 +187,14 @@ def get_all_tw_companies():
         df = df.rename(columns={'stock_id': '代號', 'stock_name': '名稱', 'type': '市場別', 'industry_category': '產業別'})
         df['代號'] = df['代號'].astype(str)
 
-        exclude_prefixes = ('00', '01', '02', '91')
-        df = df[~df['代號'].str.startswith(exclude_prefixes)]
-        df = df[df['代號'].str.isnumeric()]
-        df = df[~df['產業別'].isin(['ETF', 'ETN', '受益證券', '指數類'])]
+        # 🛡️ 升級過濾器：徹底封殺權證、特別股與非標準實體
+        df = df[df['代號'].str.isnumeric()]           # 第一關：必須全是數字（排除英文字母特別股）
+        df = df[df['代號'].str.len() == 4]            # 第二關：必須剛好 4 碼（徹底排除 6 碼權證、牛熊證）
+        exclude_prefixes = ('00', '01', '02', '91') 
+        df = df[~df['代號'].str.startswith(exclude_prefixes)] # 第三關：排除 ETF 與存託憑證開頭
+        
+        # 第四關：排除特定產業別
+        df = df[~df['產業別'].isin(['ETF', 'ETN', '受益證券', '指數類', '存託憑證', '特別股'])]
         df['市場別'] = df['市場別'].replace({'twse': '上市', 'tpex': '上櫃', 'rotc': '興櫃'})
         df = df[df['市場別'].isin(['上市', '上櫃', '興櫃'])]
         
@@ -192,6 +207,13 @@ def get_db_codes():
     try:
         res = supabase.table("underwriting_cache").select("code").execute()
         return {str(item['code']) for item in res.data}
+    except: return set()
+
+def get_news_db_codes():
+    try:
+        # 新增：向 Supabase 索取已經有重訊資料的代號名單
+        res = supabase.table("mops_news_cache").select("stock_code").execute()
+        return {str(item['stock_code']) for item in res.data}
     except: return set()
 
 # ==========================================
@@ -273,13 +295,13 @@ def process_data(stock_code, stock_name, skip_ai=False):
         return None
 
 # ==========================================
-# 🚀 介面與功能觸發 (雙表寫入邏輯)
+# 🚀 介面與功能觸發 (搭載智慧跳過機制)
 # ==========================================
 tab1, tab2 = st.tabs(["🔍 補漏監控 (批次)", "📝 數據進件工作台"])
 
 with tab1:
     st.markdown("### 📉 缺漏名單自動補足")
-    st.info("系統會自動抓取財務數據寫入 `underwriting_cache`，並將重大訊息寫入 `mops_news_cache`。")
+    st.info("系統將嚴格把關，過濾非實體標的，並自動跳過已有資料的公司以節省資源。")
     
     col_a, col_b = st.columns(2)
     if col_a.button("🔄 1. 開始掃描缺漏", type="primary"):
@@ -291,14 +313,13 @@ with tab1:
                 db_codes = get_db_codes()
                 missing = market_df[~market_df['代號'].astype(str).isin(db_codes)].copy()
                 st.session_state.missing_list = missing
-                st.success(f"掃描完畢！資料庫已有 {len(db_codes)} 家，尚缺 {len(missing)} 家。")
+                st.success(f"掃描完畢！已過濾權證與 ETN。目前資料庫已有 {len(db_codes)} 家，尚缺 {len(missing)} 家。")
 
     if 'missing_list' in st.session_state and not st.session_state.missing_list.empty:
         m_list = st.session_state.missing_list
         st.dataframe(m_list.head(100))
         batch_count = st.slider("選擇補足家數", 1, len(m_list), 10)
         
-        # 🌟 批次作業分成兩顆按鈕：完整雙軌 vs 僅極速重訊
         col_batch1, col_batch2 = st.columns(2)
         
         with col_batch1:
@@ -306,9 +327,21 @@ with tab1:
                 p_bar = st.progress(0)
                 st_status = st.empty()
                 success_cnt = 0
+                skip_cnt = 0
+                
+                # 執行前先抓出現有的財報與重訊名單
+                existing_fin_codes = get_db_codes()
+                existing_news_codes = get_news_db_codes()
                 
                 for i, row in enumerate(m_list.head(batch_count).itertuples()):
-                    st_status.text(f"⏳ 處理中 ({i+1}/{batch_count}): {row.代號} {row.名稱} (抓取財報與近百篇重訊...)")
+                    # 智慧判斷：如果財報跟重訊都已經存在，就直接跳過
+                    if str(row.代號) in existing_fin_codes and str(row.代號) in existing_news_codes:
+                        st_status.text(f"⏭️ 略過 ({i+1}/{batch_count}): {row.代號} {row.名稱} (已有完整雙軌資料)")
+                        skip_cnt += 1
+                        p_bar.progress((i+1)/batch_count)
+                        continue
+                        
+                    st_status.text(f"⏳ 處理中 ({i+1}/{batch_count}): {row.代號} {row.名稱} (抓取財報與重訊...)")
                     res_data = process_data(row.代號, row.名稱, skip_ai=True)
                     if res_data:
                         supabase.table("underwriting_cache").upsert({
@@ -319,16 +352,27 @@ with tab1:
                         }).execute()
                         success_cnt += 1
                     p_bar.progress((i+1)/batch_count)
-                st.success(f"✅ 批次雙軌更新完成！成功補足 {success_cnt} 家資料。")
+                st.success(f"✅ 批次作業結束！成功更新 {success_cnt} 家，智慧跳過 {skip_cnt} 家。")
                 
         with col_batch2:
             if st.button(f"📰 批次極速補足 (僅更新重訊) - {batch_count} 家", type="primary", use_container_width=True):
                 p_bar = st.progress(0)
                 st_status = st.empty()
                 success_cnt = 0
+                skip_cnt = 0
+                
+                # 執行前先抓出現有的重訊名單
+                existing_news_codes = get_news_db_codes()
                 
                 for i, row in enumerate(m_list.head(batch_count).itertuples()):
-                    st_status.text(f"⏳ 處理中 ({i+1}/{batch_count}): {row.代號} {row.名稱} (極速繞過財報，專注爬取重訊...)")
+                    # 智慧判斷：如果重訊資料庫已經有這家公司，就直接跳過
+                    if str(row.代號) in existing_news_codes:
+                        st_status.text(f"⏭️ 略過 ({i+1}/{batch_count}): {row.代號} {row.名稱} (已有風險重訊資料)")
+                        skip_cnt += 1
+                        p_bar.progress((i+1)/batch_count)
+                        continue
+                        
+                    st_status.text(f"⏳ 處理中 ({i+1}/{batch_count}): {row.代號} {row.名稱} (專注爬取最新風險重訊...)")
                     only_news = fetch_mops_detailed_news(row.代號)
                     if only_news is not None:
                         supabase.table("mops_news_cache").upsert({
@@ -338,7 +382,7 @@ with tab1:
                         }).execute()
                         success_cnt += 1
                     p_bar.progress((i+1)/batch_count)
-                st.success(f"✅ 批次獨立重訊更新完成！成功寫入 {success_cnt} 家最新風險資料。")
+                st.success(f"✅ 批次重訊作業結束！成功寫入 {success_cnt} 家最新風險，智慧跳過 {skip_cnt} 家。")
 
 with tab2:
     st.markdown("### 📝 單筆數據進件與更新")
@@ -377,7 +421,7 @@ with tab2:
                     st.success(f"✅ {sn} 完整調查與重訊已存入中台雙表！")
 
     with col_btn3:
-        if st.button("📰 僅更新重訊", use_container_width=True):
+        if st.button("📰 僅強制更新重訊", use_container_width=True):
             with st.spinner(f"🚀 繞過財務 API，極速單獨抓取 {sn} 的官方重訊..."):
                 only_news = fetch_mops_detailed_news(sc)
                 
