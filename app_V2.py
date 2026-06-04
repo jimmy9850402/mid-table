@@ -23,8 +23,6 @@ st.title("🛡️ D&O 智能核保 - 數據採集與情報總管")
 # ==========================================
 SUPABASE_URL = "https://cemnzictjgunjyktrruc.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNlbW56aWN0amd1bmp5a3RycnVjIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2OTA1MTU2MSwiZXhwIjoyMDg0NjI3NTYxfQ.LScr9qrJV7EcjTxp_f47r6-PLMsxz-mJTTblL4ZTmbs" 
-
-# 已為您填入指定的 Gemini API Key
 GEMINI_API_KEY = "AIzaSyCWng91o6S_wYygIhg-BryYQQaUdUOvFnQ" 
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -269,7 +267,6 @@ def process_data(stock_code, stock_name, skip_ai=False):
         
         mops_news = fetch_mops_detailed_news(stock_code)
         
-        # 回傳字典，分離兩張表
         return {"financials": final_list, "news": mops_news}
     except Exception as e:
         st.error(f"數據處理錯誤: {e}")
@@ -299,29 +296,49 @@ with tab1:
     if 'missing_list' in st.session_state and not st.session_state.missing_list.empty:
         m_list = st.session_state.missing_list
         st.dataframe(m_list.head(100))
-        batch_count = st.slider("選擇補足家數 (建議 10-20 家)", 1, len(m_list), 10)
+        batch_count = st.slider("選擇補足家數", 1, len(m_list), 10)
         
-        if st.button(f"🚀 啟動批次補足 ({batch_count} 家)"):
-            p_bar = st.progress(0)
-            st_status = st.empty()
-            success_cnt = 0
-            
-            for i, row in enumerate(m_list.head(batch_count).itertuples()):
-                st_status.text(f"⏳ 處理中 ({i+1}/{batch_count}): {row.代號} {row.名稱} (這會抓取近百篇重訊，請稍候...)")
-                res_data = process_data(row.代號, row.名稱, skip_ai=True)
-                if res_data:
-                    # 1. 寫入財務表
-                    supabase.table("underwriting_cache").upsert({
-                        "code": row.代號, "name": row.名稱, "financial_data": res_data["financials"], "updated_at": datetime.now().isoformat()
-                    }).execute()
-                    
-                    # 2. 寫入重訊表
-                    supabase.table("mops_news_cache").upsert({
-                        "stock_code": row.代號, "news_data": res_data["news"], "updated_at": datetime.now().isoformat()
-                    }).execute()
-                    success_cnt += 1
-                p_bar.progress((i+1)/batch_count)
-            st.success(f"✅ 批次更新完成！成功補足 {success_cnt} 家雙軌資料。")
+        # 🌟 批次作業分成兩顆按鈕：完整雙軌 vs 僅極速重訊
+        col_batch1, col_batch2 = st.columns(2)
+        
+        with col_batch1:
+            if st.button(f"🚀 批次補足 (財報+重訊) - {batch_count} 家", use_container_width=True):
+                p_bar = st.progress(0)
+                st_status = st.empty()
+                success_cnt = 0
+                
+                for i, row in enumerate(m_list.head(batch_count).itertuples()):
+                    st_status.text(f"⏳ 處理中 ({i+1}/{batch_count}): {row.代號} {row.名稱} (抓取財報與近百篇重訊...)")
+                    res_data = process_data(row.代號, row.名稱, skip_ai=True)
+                    if res_data:
+                        supabase.table("underwriting_cache").upsert({
+                            "code": row.代號, "name": row.名稱, "financial_data": res_data["financials"], "updated_at": datetime.now().isoformat()
+                        }).execute()
+                        supabase.table("mops_news_cache").upsert({
+                            "stock_code": row.代號, "news_data": res_data["news"], "updated_at": datetime.now().isoformat()
+                        }).execute()
+                        success_cnt += 1
+                    p_bar.progress((i+1)/batch_count)
+                st.success(f"✅ 批次雙軌更新完成！成功補足 {success_cnt} 家資料。")
+                
+        with col_batch2:
+            if st.button(f"📰 批次極速補足 (僅更新重訊) - {batch_count} 家", type="primary", use_container_width=True):
+                p_bar = st.progress(0)
+                st_status = st.empty()
+                success_cnt = 0
+                
+                for i, row in enumerate(m_list.head(batch_count).itertuples()):
+                    st_status.text(f"⏳ 處理中 ({i+1}/{batch_count}): {row.代號} {row.名稱} (極速繞過財報，專注爬取重訊...)")
+                    only_news = fetch_mops_detailed_news(row.代號)
+                    if only_news is not None:
+                        supabase.table("mops_news_cache").upsert({
+                            "stock_code": row.代號, 
+                            "news_data": only_news, 
+                            "updated_at": datetime.now().isoformat()
+                        }).execute()
+                        success_cnt += 1
+                    p_bar.progress((i+1)/batch_count)
+                st.success(f"✅ 批次獨立重訊更新完成！成功寫入 {success_cnt} 家最新風險資料。")
 
 with tab2:
     st.markdown("### 📝 單筆數據進件與更新")
