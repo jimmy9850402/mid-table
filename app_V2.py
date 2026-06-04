@@ -19,21 +19,23 @@ st.set_page_config(page_title="富邦 D&O 採集引擎 V2.0 (雙軌寫入版)", 
 st.title("🛡️ D&O 智能核保 - 數據採集與情報總管")
 
 # ==========================================
-# 🔑 密碼直接寫死區 (暴力破解法，免設環境變數)
+# 🔑 密碼直接寫死區 (暴力破解法)
 # ==========================================
 SUPABASE_URL = "https://cemnzictjgunjyktrruc.supabase.co"
 # 已經為您填入 Supabase 最高權限金鑰
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNlbW56aWN0amd1bmp5a3RycnVjIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2OTA1MTU2MSwiZXhwIjoyMDg0NjI3NTYxfQ.LScr9qrJV7EcjTxp_f47r6-PLMsxz-mJTTblL4ZTmbs" 
 
-# ⚠️ 請把下面這行換成您真實的 Gemini API Key，保留雙引號 ""
-GEMINI_API_KEY = "AIzaSyCWng91o6S_wYygIhg-BryYQQaUdUOvFnQ"
-
-if not SUPABASE_KEY or SUPABASE_KEY.startswith("eyJhbGciOiJIUzI1NiIsInR5cCI6Ik..."):
-    st.error("⚠️ 程式碼內的 Supabase Key 尚未填寫完整，請替換為真實密碼！")
-    st.stop()
+# 👇 您要找的「Gemini 密碼」就在這裡！請把假字串換成您的真實金鑰
+GEMINI_API_KEY = "AIzaSyCwNg91o6S_wYygIHg..." 
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY and GEMINI_API_KEY != "AIzaSyCwNg91o6S_wYygIHg..." else None
+
+# ==========================================
+# 🔑 FinMind 專屬通行證 (解決雲端 IP 阻擋)
+# ==========================================
+FINMIND_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJkYXRlIjoiMjAyNi0wMi0wNiAxNDoxNToxMSIsInVzZXJfaWQiOiJqaW1teTk4NTA0MDIiLCJlbWFpbCI6IjExMDI1NTAyNEBnLm5jY3UuZWR1LnR3IiwiaXAiOiIyMjMuMTM3LjEwMC4xMjgifQ.2ou0rtCaMqV7XXPBh28jGWFJ7_4EQrtr2CdhNQ5YznI"
+FINMIND_HEADERS = {"Authorization": f"Bearer {FINMIND_TOKEN}"}
 
 # ==========================================
 # 🤖 核心功能：AI 輿情探勘
@@ -64,9 +66,8 @@ def fetch_stock_analysis(stock_code):
     try:
         url = "https://api.finmindtrade.com/api/v4/data"
         start_date = (datetime.now() - timedelta(days=1095)).strftime('%Y-%m-%d')
-        # 測試用免 Token 通道
         params = {"dataset": "TaiwanStockPrice", "data_id": stock_code, "start_date": start_date}
-        res = requests.get(url, params=params, verify=False, timeout=15).json().get('data', [])
+        res = requests.get(url, params=params, headers=FINMIND_HEADERS, verify=False, timeout=15).json().get('data', [])
         
         if not res: return []
         
@@ -170,7 +171,7 @@ def get_all_tw_companies():
     try:
         url = "https://api.finmindtrade.com/api/v4/data"
         params = {"dataset": "TaiwanStockInfo"}
-        res = requests.get(url, params=params, verify=False, timeout=15)
+        res = requests.get(url, params=params, headers=FINMIND_HEADERS, verify=False, timeout=15)
         data = res.json().get('data', [])
         if not data: return pd.DataFrame()
 
@@ -206,7 +207,7 @@ def process_data(stock_code, stock_name, skip_ai=False):
 
         def fetch(ds):
             time.sleep(1.1)
-            return requests.get(base_url, params={"dataset": ds, "data_id": stock_code, "start_date": lookback}, verify=False).json().get('data', [])
+            return requests.get(base_url, params={"dataset": ds, "data_id": stock_code, "start_date": lookback}, headers=FINMIND_HEADERS, verify=False).json().get('data', [])
 
         income = fetch("TaiwanStockFinancialStatements")
         balance = fetch("TaiwanStockBalanceSheet")
