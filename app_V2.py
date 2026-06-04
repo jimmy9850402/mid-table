@@ -18,13 +18,18 @@ requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 st.set_page_config(page_title="富邦 D&O 採集引擎 V2.0 (雙軌寫入版)", layout="wide", page_icon="🛡️")
 st.title("🛡️ D&O 智能核保 - 數據採集與情報總管")
 
-# 環境變數設定
-SUPABASE_URL = os.getenv("SUPABASE_URL") or st.secrets.get("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY") or st.secrets.get("SUPABASE_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY")
+# ==========================================
+# 🔑 密碼直接寫死區 (暴力破解法，免設環境變數)
+# ==========================================
+SUPABASE_URL = "https://cemnzictjgunjyktrruc.supabase.co"
+# 已經為您填入 Supabase 最高權限金鑰
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNlbW56aWN0amd1bmp5a3RycnVjIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2OTA1MTU2MSwiZXhwIjoyMDg0NjI3NTYxfQ.LScr9qrJV7EcjTxp_f47r6-PLMsxz-mJTTblL4ZTmbs" 
 
-if not SUPABASE_URL or not SUPABASE_KEY:
-    st.error("⚠️ 請在環境變數中設定 Supabase 連線資訊")
+# ⚠️ 請把下面這行換成您真實的 Gemini API Key，保留雙引號 ""
+GEMINI_API_KEY = "AIzaSyCWng91o6S_wYygIhg-BryYQQaUdUOvFnQ"
+
+if not SUPABASE_KEY or SUPABASE_KEY.startswith("eyJhbGciOiJIUzI1NiIsInR5cCI6Ik..."):
+    st.error("⚠️ 程式碼內的 Supabase Key 尚未填寫完整，請替換為真實密碼！")
     st.stop()
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -134,7 +139,7 @@ def fetch_mops_detailed_news(stock_code):
                 
                 retry_count = 0
                 while retry_count < 3:
-                    time.sleep(0.5) # Streamlit 中稍微縮短休眠，避免 UI 超時
+                    time.sleep(0.5) 
                     detail_res = session.post(post_url, data=detail_payload, headers=headers, verify=False, timeout=15)
                     detail_res.encoding = 'utf8'
                     detail_soup = BeautifulSoup(detail_res.text, 'html.parser')
@@ -256,18 +261,15 @@ def process_data(stock_code, stock_name, skip_ai=False):
                     row[lbl] = f"{int(v/1000):,}" if v is not None else "-"
             final_list.append(row)
 
-        # 組合股價分析
         stock_data = fetch_stock_analysis(stock_code)
         final_list.append({"項目": "近三年股價與大盤", "股價分析數據": stock_data})
 
-        # 組合 AI 探勘
         ai_result = ai_web_research(stock_name) if not skip_ai else "（快速更新模式：未啟動網路探勘）"
         final_list.append({"項目": "AI深度網路探勘(非財務特徵)", "探勘結果": ai_result})
         
-        # 抓取重訊 (不放進 final_list，獨立拉出來)
         mops_news = fetch_mops_detailed_news(stock_code)
         
-        # 關鍵：回傳字典，分離兩張表
+        # 回傳字典，分離兩張表
         return {"financials": final_list, "news": mops_news}
     except Exception as e:
         st.error(f"數據處理錯誤: {e}")
@@ -306,7 +308,7 @@ with tab1:
             
             for i, row in enumerate(m_list.head(batch_count).itertuples()):
                 st_status.text(f"⏳ 處理中 ({i+1}/{batch_count}): {row.代號} {row.名稱} (這會抓取近百篇重訊，請稍候...)")
-                res_data = process_data(row.代號, row.名稱, skip_ai=True) # 批次建議 skip ai 避免 API 爆掉
+                res_data = process_data(row.代號, row.名稱, skip_ai=True)
                 if res_data:
                     # 1. 寫入財務表
                     supabase.table("underwriting_cache").upsert({
