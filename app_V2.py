@@ -19,17 +19,16 @@ st.set_page_config(page_title="富邦 D&O 採集引擎 V2.0 (雙軌寫入版)", 
 st.title("🛡️ D&O 智能核保 - 數據採集與情報總管")
 
 # ==========================================
-# 🔑 密碼直接寫死區 (暴力破解法)
+# 🔑 密碼直接寫死區 (暴力破解法，免設環境變數)
 # ==========================================
 SUPABASE_URL = "https://cemnzictjgunjyktrruc.supabase.co"
-# 已經為您填入 Supabase 最高權限金鑰
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNlbW56aWN0amd1bmp5a3RycnVjIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2OTA1MTU2MSwiZXhwIjoyMDg0NjI3NTYxfQ.LScr9qrJV7EcjTxp_f47r6-PLMsxz-mJTTblL4ZTmbs" 
 
-# 👇 您要找的「Gemini 密碼」就在這裡！請把假字串換成您的真實金鑰
-GEMINI_API_KEY = "AIzaSyCwNg91o6S_wYygIHg..." 
+# 已為您填入指定的 Gemini API Key
+GEMINI_API_KEY = "AIzaSyCWng91o6S_wYygIhg-BryYQQaUdUOvFnQ" 
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY and GEMINI_API_KEY != "AIzaSyCwNg91o6S_wYygIHg..." else None
+ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 # ==========================================
 # 🔑 FinMind 專屬通行證 (解決雲端 IP 阻擋)
@@ -330,10 +329,10 @@ with tab2:
     sc = c1.text_input("股票代號", "2201")
     sn = c2.text_input("公司名稱", "裕隆")
 
-    col_btn1, col_btn2 = st.columns(2)
+    col_btn1, col_btn2, col_btn3 = st.columns(3)
 
     with col_btn1:
-        if st.button("⚡ 快速更新 (財務及股價 + 重訊)", use_container_width=True):
+        if st.button("⚡ 快速更新 (財報+重訊)", use_container_width=True):
             with st.spinner(f"正在同步 {sn} 的財務指標與公開重訊..."):
                 res = process_data(sc, sn, skip_ai=True)
                 if res:
@@ -348,7 +347,7 @@ with tab2:
                         st.json(res["financials"][:2])
 
     with col_btn2:
-        if st.button("🔍 深度更新 (含 AI 探勘)", type="primary", use_container_width=True):
+        if st.button("🔍 深度更新 (含 AI)", type="primary", use_container_width=True):
             with st.spinner("正在進行完整核保調查 (含網路搜尋與所有重訊)..."):
                 res = process_data(sc, sn, skip_ai=False)
                 if res:
@@ -359,3 +358,19 @@ with tab2:
                         "stock_code": sc, "news_data": res["news"], "updated_at": datetime.now().isoformat()
                     }).execute()
                     st.success(f"✅ {sn} 完整調查與重訊已存入中台雙表！")
+
+    with col_btn3:
+        if st.button("📰 僅更新重訊", use_container_width=True):
+            with st.spinner(f"🚀 繞過財務 API，極速單獨抓取 {sn} 的官方重訊..."):
+                only_news = fetch_mops_detailed_news(sc)
+                
+                if only_news is not None:
+                    supabase.table("mops_news_cache").upsert({
+                        "stock_code": sc, 
+                        "news_data": only_news, 
+                        "updated_at": datetime.now().isoformat()
+                    }).execute()
+                    
+                    st.success(f"✅ 獨立更新完成！{sn} 的最新 {len(only_news)} 筆重訊已寫入！")
+                    with st.expander("預覽最新重訊 (前3筆)"):
+                        st.json(only_news[:3] if only_news else [{"訊息": "近三年無重訊"}])
