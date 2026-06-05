@@ -15,7 +15,7 @@ from bs4 import BeautifulSoup
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 # --- 1. 系統初始化 ---
-st.set_page_config(page_title="富邦 D&O 採集引擎 V2.0 (雙軌寫入版)", layout="wide", page_icon="🛡️")
+st.set_page_config(page_title="富邦 D&O 採集引擎 V2.0 (雙軌過濾版)", layout="wide", page_icon="🛡️")
 st.title("🛡️ D&O 智能核保 - 數據採集與情報總管")
 
 # ==========================================
@@ -92,7 +92,7 @@ def fetch_mops_detailed_news(stock_code):
     target_years = [current_roc_year, current_roc_year - 1, current_roc_year - 2]
     detailed_news = []
     
-    # 🚨 D&O 核保專屬地雷關鍵字
+    # 🚨 D&O 核保專屬地雷關鍵字 (只有命中才會存入，省容量)
     danger_keywords = [
         "訴訟", "掏空", "辭任", "變動達三分之一", "退票", "終止買賣", 
         "保留意見", "繼續經營", "虧損", "解任", "調查", "違規", 
@@ -172,7 +172,7 @@ def fetch_mops_detailed_news(stock_code):
     return detailed_news
 
 # ==========================================
-# 📊 數據庫讀取功能 (升級嚴格過濾版)
+# 📊 數據庫讀取功能 (嚴格剃除權證版)
 # ==========================================
 @st.cache_data(ttl=3600)
 def get_all_tw_companies():
@@ -185,16 +185,23 @@ def get_all_tw_companies():
 
         df = pd.DataFrame(data)
         df = df.rename(columns={'stock_id': '代號', 'stock_name': '名稱', 'type': '市場別', 'industry_category': '產業別'})
-        df['代號'] = df['代號'].astype(str)
-
-        # 🛡️ 升級過濾器：徹底封殺權證、特別股與非標準實體
-        df = df[df['代號'].str.isnumeric()]           # 第一關：必須全是數字（排除英文字母特別股）
-        df = df[df['代號'].str.len() == 4]            # 第二關：必須剛好 4 碼（徹底排除 6 碼權證、牛熊證）
-        exclude_prefixes = ('00', '01', '02', '91') 
-        df = df[~df['代號'].str.startswith(exclude_prefixes)] # 第三關：排除 ETF 與存託憑證開頭
         
-        # 第四關：排除特定產業別
+        # 🛡️ 核心防護：徹底清理代號並嚴格篩選
+        df['代號'] = df['代號'].astype(str).str.strip()
+        
+        # 1. 必須剛好 4 碼 (完美排除 710533、709983 等 6 碼權證)
+        df = df[df['代號'].str.len() == 4]
+        
+        # 2. 必須全部都是數字 (排除 2881A 特別股等)
+        df = df[df['代號'].str.isnumeric()]
+        
+        # 3. 排除 ETF 等基金代碼開頭
+        exclude_prefixes = ('00', '01', '02', '91') 
+        df = df[~df['代號'].str.startswith(exclude_prefixes)]
+        
+        # 4. 排除特定非實體產業別
         df = df[~df['產業別'].isin(['ETF', 'ETN', '受益證券', '指數類', '存託憑證', '特別股'])]
+        
         df['市場別'] = df['市場別'].replace({'twse': '上市', 'tpex': '上櫃', 'rotc': '興櫃'})
         df = df[df['市場別'].isin(['上市', '上櫃', '興櫃'])]
         
@@ -211,7 +218,6 @@ def get_db_codes():
 
 def get_news_db_codes():
     try:
-        # 新增：向 Supabase 索取已經有重訊資料的代號名單
         res = supabase.table("mops_news_cache").select("stock_code").execute()
         return {str(item['stock_code']) for item in res.data}
     except: return set()
@@ -295,13 +301,13 @@ def process_data(stock_code, stock_name, skip_ai=False):
         return None
 
 # ==========================================
-# 🚀 介面與功能觸發 (搭載智慧跳過機制)
+# 🚀 介面與功能觸發 (搭載雙層智慧跳過機制)
 # ==========================================
 tab1, tab2 = st.tabs(["🔍 補漏監控 (批次)", "📝 數據進件工作台"])
 
 with tab1:
     st.markdown("### 📉 缺漏名單自動補足")
-    st.info("系統將嚴格把關，過濾非實體標的，並自動跳過已有資料的公司以節省資源。")
+    st.info("系統將嚴格把關，徹底過濾權證及非實體標的，且自動跳過資料庫已有的公司。")
     
     col_a, col_b = st.columns(2)
     if col_a.button("🔄 1. 開始掃描缺漏", type="primary"):
@@ -311,9 +317,10 @@ with tab1:
                 st.error("❌ 無法取得市場名單！")
             else:
                 db_codes = get_db_codes()
+                # 🛡️ 第一層防護：掃描時就直接把已經有的公司剃除，不會出現在缺漏清單中
                 missing = market_df[~market_df['代號'].astype(str).isin(db_codes)].copy()
                 st.session_state.missing_list = missing
-                st.success(f"掃描完畢！已過濾權證與 ETN。目前資料庫已有 {len(db_codes)} 家，尚缺 {len(missing)} 家。")
+                st.success(f"掃描完畢！已完美剃除權證與衍生商品。目前資料庫已有 {len(db_codes)} 家，尚缺 {len(missing)} 家。")
 
     if 'missing_list' in st.session_state and not st.session_state.missing_list.empty:
         m_list = st.session_state.missing_list
@@ -329,12 +336,12 @@ with tab1:
                 success_cnt = 0
                 skip_cnt = 0
                 
-                # 執行前先抓出現有的財報與重訊名單
+                # 執行前再次抓取現有的財報與重訊名單 (確保即時性)
                 existing_fin_codes = get_db_codes()
                 existing_news_codes = get_news_db_codes()
                 
                 for i, row in enumerate(m_list.head(batch_count).itertuples()):
-                    # 智慧判斷：如果財報跟重訊都已經存在，就直接跳過
+                    # 🛡️ 第二層防護：執行迴圈時若偵測到已有資料，秒速略過
                     if str(row.代號) in existing_fin_codes and str(row.代號) in existing_news_codes:
                         st_status.text(f"⏭️ 略過 ({i+1}/{batch_count}): {row.代號} {row.名稱} (已有完整雙軌資料)")
                         skip_cnt += 1
@@ -361,11 +368,9 @@ with tab1:
                 success_cnt = 0
                 skip_cnt = 0
                 
-                # 執行前先抓出現有的重訊名單
                 existing_news_codes = get_news_db_codes()
                 
                 for i, row in enumerate(m_list.head(batch_count).itertuples()):
-                    # 智慧判斷：如果重訊資料庫已經有這家公司，就直接跳過
                     if str(row.代號) in existing_news_codes:
                         st_status.text(f"⏭️ 略過 ({i+1}/{batch_count}): {row.代號} {row.名稱} (已有風險重訊資料)")
                         skip_cnt += 1
