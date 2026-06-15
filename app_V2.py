@@ -15,7 +15,7 @@ from bs4 import BeautifulSoup
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 # --- 1. 系統初始化 ---
-st.set_page_config(page_title="富邦 D&O 採集引擎 V2.0 (雙軌過濾版)", layout="wide", page_icon="🛡️")
+st.set_page_config(page_title="富邦 D&O 採集引擎 V3.0 (功能分流版)", layout="wide", page_icon="🛡️")
 st.title("🛡️ D&O 智能核保 - 數據採集與情報總管")
 
 # ==========================================
@@ -35,7 +35,7 @@ FINMIND_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJkYXRlIjoiMjAyNi0wMi0wNi
 FINMIND_HEADERS = {"Authorization": f"Bearer {FINMIND_TOKEN}"}
 
 # ==========================================
-# 🤖 核心功能：AI 輿情探勘
+# 🤖 輔助功能：AI 輿情探勘
 # ==========================================
 def ai_web_research(company_name):
     if not ai_client: return "⚠️ 未設定 API KEY"
@@ -57,7 +57,7 @@ def ai_web_research(company_name):
     except: return "⚠️ 探勘超限，建議使用快速更新模式。"
 
 # ==========================================
-# 📈 核心功能：股價趨勢分析
+# 📈 輔助功能：股價趨勢分析
 # ==========================================
 def fetch_stock_analysis(stock_code):
     try:
@@ -85,14 +85,116 @@ def fetch_stock_analysis(stock_code):
     except: return []
 
 # ==========================================
-# 🕵️ 核心功能：MOPS 舊版後門重訊爬蟲 (搭載高風險智能濾網)
+# 📊 核心模組一：獲取財務數據 (已修正年度累加邏輯)
+# ==========================================
+def get_financials(stock_code, stock_name, skip_ai=False):
+    try:
+        lookback = (datetime.now() - timedelta(days=1100)).strftime('%Y-%m-%d')
+        base_url = "https://api.finmindtrade.com/api/v4/data"
+
+        def fetch(ds):
+            time.sleep(1.1) # 避免被擋
+            return requests.get(base_url, params={"dataset": ds, "data_id": stock_code, "start_date": lookback}, headers=FINMIND_HEADERS, verify=False).json().get('data', [])
+
+        income = fetch("TaiwanStockFinancialStatements")
+        balance = fetch("TaiwanStockBalanceSheet")
+        cash = fetch("TaiwanStockCashFlowsStatement")
+        
+        if not income: return None
+
+        bucket = {}
+        # 步驟 1：先將所有「季度」資料裝入 bucket
+        for r in income + balance + cash:
+            dt = datetime.strptime(r['date'], '%Y-%m-%d')
+            q_label = f"{dt.year-1911}年 Q{(dt.month-1)//3+1}"
+            
+            if q_label not in bucket: bucket[q_label] = {}
+            t, v = r.get('type'), r.get('value')
+            if v is not None:
+                if t in ['OperatingRevenue', 'Revenue']: bucket[q_label]['營收'] = v
+                if t == 'TotalAssets': bucket[q_label]['總資產'] = v
+                if t == 'TotalLiabilities': bucket[q_label]['總負債'] = v
+                if t == 'TotalCurrentAssets': bucket[q_label]['流動資產'] = v
+                if t == 'TotalCurrentLiabilities': bucket[q_label]['流動負債'] = v
+                if t in ['EPS', 'BasicEarningsPerShare']: bucket[q_label]['EPS'] = v
+                if t == 'NetCashFlowsFromUsedInOperatingActivities': bucket[q_label]['營業活動淨現金流'] = v
+
+        # 步驟 2：根據會計法則，動態計算「年度」資料 (修正版)
+        years_set = {lbl.split("年")[0] for lbl in bucket.keys()}
+        for y in years_set:
+            y_lbl = f"{y}年"
+            bucket[y_lbl] = {}
+            
+            rev_sum = eps_sum = cf_sum = 0
+            latest_q_in_year = None
+            
+            for q in range(1, 5):
+                q_lbl = f"{y}年 Q{q}"
+                if q_lbl in bucket:
+                    latest_q_in_year = q_lbl
+                    rev_sum += bucket[q_lbl].get('營收', 0)
+                    eps_sum += bucket[q_lbl].get('EPS', 0)
+                    cf_sum += bucket[q_lbl].get('營業活動淨現金流', 0)
+            
+            if rev_sum != 0: bucket[y_lbl]['營收'] = rev_sum
+            if eps_sum != 0: bucket[y_lbl]['EPS'] = eps_sum
+            if cf_sum != 0: bucket[y_lbl]['營業活動淨現金流'] = cf_sum
+            
+            if latest_q_in_year:
+                bucket[y_lbl]['總資產'] = bucket[latest_q_in_year].get('總資產')
+                bucket[y_lbl]['總負債'] = bucket[latest_q_in_year].get('總負債')
+                bucket[y_lbl]['流動資產'] = bucket[latest_q_in_year].get('流動資產')
+                bucket[y_lbl]['流動負債'] = bucket[latest_q_in_year].get('流動負債')
+
+        items_map = ["營業收入", "總資產", "負債比", "流動資產", "流動負債", "每股盈餘(EPS)", "營業活動淨現金流"]
+        final_list = []
+        
+        for item in items_map:
+            row = {"項目": item}
+            for lbl, vals in bucket.items():
+                if item == "營業收入":
+                    v = vals.get('營收')
+                    row[lbl] = f"{int(v/1000):,}" if v is not None else "-"
+                elif item == "總資產":
+                    v = vals.get('總資產')
+                    row[lbl] = f"{int(v/1000):,}" if v is not None else "-"
+                elif item == "負債比":
+                    ta, tl = vals.get('總資產'), vals.get('總負債')
+                    row[lbl] = f"{(tl/ta)*100:.2f}%" if ta and tl and ta != 0 else "nan%"
+                elif item == "流動資產":
+                    v = vals.get('流動資產')
+                    row[lbl] = f"{int(v/1000):,}" if v is not None else "-"
+                elif item == "流動負債":
+                    v = vals.get('流動負債')
+                    row[lbl] = f"{int(v/1000):,}" if v is not None else "-"
+                elif item == "每股盈餘(EPS)":
+                    v = vals.get('EPS')
+                    row[lbl] = f"{v:.2f}" if v is not None else "-"
+                elif item == "營業活動淨現金流":
+                    v = vals.get('營業活動淨現金流')
+                    row[lbl] = f"{int(v/1000):,}" if v is not None else "-"
+            final_list.append(row)
+
+        stock_data = fetch_stock_analysis(stock_code)
+        final_list.append({"項目": "近三年股價與大盤", "股價分析數據": stock_data})
+
+        ai_result = ai_web_research(stock_name) if not skip_ai else "（快速更新模式：未啟動網路探勘）"
+        final_list.append({"項目": "AI深度網路探勘(非財務特徵)", "探勘結果": ai_result})
+        
+        return final_list
+    except Exception as e:
+        st.error(f"財務數據處理錯誤: {e}")
+        return None
+
+# ==========================================
+# 🕵️ 核心模組二：MOPS 後門重訊爬蟲
 # ==========================================
 def fetch_mops_detailed_news(stock_code):
     current_roc_year = datetime.now().year - 1911
     target_years = [current_roc_year, current_roc_year - 1, current_roc_year - 2]
     detailed_news = []
     
-    # 🚨 D&O 核保專屬地雷關鍵字 (只有命中才會存入，省容量)
+    # 🚨 D&O 核保專屬地雷關鍵字
     danger_keywords = [
         "訴訟", "掏空", "辭任", "變動達三分之一", "退票", "終止買賣", 
         "保留意見", "繼續經營", "虧損", "解任", "調查", "違規", 
@@ -107,8 +209,7 @@ def fetch_mops_detailed_news(stock_code):
         'Content-Type': 'application/x-www-form-urlencoded'
     }
 
-    try:
-        session.get('https://mopsov.twse.com.tw/mops/web/t05st01', headers=headers, verify=False, timeout=10)
+    try: session.get('https://mopsov.twse.com.tw/mops/web/t05st01', headers=headers, verify=False, timeout=10)
     except: pass
 
     for year in target_years:
@@ -148,8 +249,7 @@ def fetch_mops_detailed_news(stock_code):
                     detail_res = session.post(post_url, data=detail_payload, headers=headers, verify=False, timeout=15)
                     detail_res.encoding = 'utf8'
                     detail_soup = BeautifulSoup(detail_res.text, 'html.parser')
-                    if detail_res.status_code == 200 and detail_soup.find('table', 'hasBorder'):
-                        break
+                    if detail_res.status_code == 200 and detail_soup.find('table', 'hasBorder'): break
                     retry_count += 1
                     time.sleep(1.5)
                 
@@ -172,7 +272,7 @@ def fetch_mops_detailed_news(stock_code):
     return detailed_news
 
 # ==========================================
-# 📊 數據庫讀取功能 (嚴格剃除權證版)
+# 📊 市場名單數據庫功能
 # ==========================================
 @st.cache_data(ttl=3600)
 def get_all_tw_companies():
@@ -186,22 +286,11 @@ def get_all_tw_companies():
         df = pd.DataFrame(data)
         df = df.rename(columns={'stock_id': '代號', 'stock_name': '名稱', 'type': '市場別', 'industry_category': '產業別'})
         
-        # 🛡️ 核心防護：徹底清理代號並嚴格篩選
         df['代號'] = df['代號'].astype(str).str.strip()
-        
-        # 1. 必須剛好 4 碼 (完美排除 710533、709983 等 6 碼權證)
         df = df[df['代號'].str.len() == 4]
-        
-        # 2. 必須全部都是數字 (排除 2881A 特別股等)
         df = df[df['代號'].str.isnumeric()]
-        
-        # 3. 排除 ETF 等基金代碼開頭
-        exclude_prefixes = ('00', '01', '02', '91') 
-        df = df[~df['代號'].str.startswith(exclude_prefixes)]
-        
-        # 4. 排除特定非實體產業別
+        df = df[~df['代號'].str.startswith(('00', '01', '02', '91'))]
         df = df[~df['產業別'].isin(['ETF', 'ETN', '受益證券', '指數類', '存託憑證', '特別股'])]
-        
         df['市場別'] = df['市場別'].replace({'twse': '上市', 'tpex': '上櫃', 'rotc': '興櫃'})
         df = df[df['市場別'].isin(['上市', '上櫃', '興櫃'])]
         
@@ -211,104 +300,77 @@ def get_all_tw_companies():
         return pd.DataFrame()
 
 def get_db_codes():
-    try:
-        res = supabase.table("underwriting_cache").select("code").execute()
-        return {str(item['code']) for item in res.data}
+    try: return {str(item['code']) for item in supabase.table("underwriting_cache").select("code").execute().data}
     except: return set()
 
 def get_news_db_codes():
-    try:
-        res = supabase.table("mops_news_cache").select("stock_code").execute()
-        return {str(item['stock_code']) for item in res.data}
+    try: return {str(item['stock_code']) for item in supabase.table("mops_news_cache").select("stock_code").execute().data}
     except: return set()
 
 # ==========================================
-# 📊 核心功能：雙軌數據組合 (財報 + 新聞)
+# 🚀 UI 介面與功能觸發 (全新三大分流設計)
 # ==========================================
-def process_data(stock_code, stock_name, skip_ai=False):
-    try:
-        lookback = (datetime.now() - timedelta(days=1100)).strftime('%Y-%m-%d')
-        base_url = "https://api.finmindtrade.com/api/v4/data"
+tab1, tab2 = st.tabs(["📝 單筆數據進件工作台", "🔍 批次自動補漏監控"])
 
-        def fetch(ds):
-            time.sleep(1.1)
-            return requests.get(base_url, params={"dataset": ds, "data_id": stock_code, "start_date": lookback}, headers=FINMIND_HEADERS, verify=False).json().get('data', [])
-
-        income = fetch("TaiwanStockFinancialStatements")
-        balance = fetch("TaiwanStockBalanceSheet")
-        cash = fetch("TaiwanStockCashFlowsStatement")
-        
-        if not income: return None
-
-        bucket = {}
-        for r in income + balance + cash:
-            dt = datetime.strptime(r['date'], '%Y-%m-%d')
-            q_label = f"{dt.year-1911}年 Q{(dt.month-1)//3+1}"
-            year_label = f"{dt.year-1911}年"
-            
-            for lbl in [q_label, year_label]:
-                if lbl not in bucket: bucket[lbl] = {}
-                t, v = r.get('type'), r.get('value')
-                if v is not None:
-                    if t in ['OperatingRevenue', 'Revenue']: bucket[lbl]['營收'] = v
-                    if t == 'TotalAssets': bucket[lbl]['總資產'] = v
-                    if t == 'TotalLiabilities': bucket[lbl]['總負債'] = v
-                    if t == 'TotalCurrentAssets': bucket[lbl]['流動資產'] = v
-                    if t == 'TotalCurrentLiabilities': bucket[lbl]['流動負債'] = v
-                    if t in ['EPS', 'BasicEarningsPerShare']: bucket[lbl]['EPS'] = v
-                    if t == 'NetCashFlowsFromUsedInOperatingActivities': bucket[lbl]['營業活動淨現金流'] = v
-
-        items_map = ["營業收入", "總資產", "負債比", "流動資產", "流動負債", "每股盈餘(EPS)", "營業活動淨現金流"]
-        final_list = []
-        
-        for item in items_map:
-            row = {"項目": item}
-            for lbl, vals in bucket.items():
-                if item == "營業收入":
-                    v = vals.get('營收')
-                    row[lbl] = f"{int(v/1000):,}" if v is not None else "-"
-                elif item == "總資產":
-                    v = vals.get('總資產')
-                    row[lbl] = f"{int(v/1000):,}" if v is not None else "-"
-                elif item == "負債比":
-                    ta, tl = vals.get('總資產'), vals.get('總負債')
-                    row[lbl] = f"{(tl/ta)*100:.2f}%" if ta and tl and ta != 0 else "nan%"
-                elif item == "流動資產":
-                    v = vals.get('流動資產')
-                    row[lbl] = f"{int(v/1000):,}" if v is not None else "-"
-                elif item == "流動負債":
-                    v = vals.get('流動負債')
-                    row[lbl] = f"{int(v/1000):,}" if v is not None else "-"
-                elif item == "每股盈餘(EPS)":
-                    v = vals.get('EPS')
-                    row[lbl] = f"{v:.2f}" if v is not None else "-"
-                elif item == "營業活動淨現金流":
-                    v = vals.get('營業活動淨現金流')
-                    row[lbl] = f"{int(v/1000):,}" if v is not None else "-"
-            final_list.append(row)
-
-        stock_data = fetch_stock_analysis(stock_code)
-        final_list.append({"項目": "近三年股價與大盤", "股價分析數據": stock_data})
-
-        ai_result = ai_web_research(stock_name) if not skip_ai else "（快速更新模式：未啟動網路探勘）"
-        final_list.append({"項目": "AI深度網路探勘(非財務特徵)", "探勘結果": ai_result})
-        
-        mops_news = fetch_mops_detailed_news(stock_code)
-        
-        return {"financials": final_list, "news": mops_news}
-    except Exception as e:
-        st.error(f"數據處理錯誤: {e}")
-        return None
-
-# ==========================================
-# 🚀 介面與功能觸發 (搭載雙層智慧跳過機制)
-# ==========================================
-tab1, tab2 = st.tabs(["🔍 補漏監控 (批次)", "📝 數據進件工作台"])
-
+# ----------------- Tab 1: 單筆更新 -----------------
 with tab1:
-    st.markdown("### 📉 缺漏名單自動補足")
-    st.info("系統將嚴格把關，徹底過濾權證及非實體標的，且自動跳過資料庫已有的公司。")
+    st.markdown("### 📝 單筆數據進件與更新")
+    st.info("系統已升級！您可以依據實務需求，單獨更新財務數據、風險重訊，或是同步雙軌更新。")
     
+    c1, c2 = st.columns(2)
+    sc = c1.text_input("股票代號", "2201")
+    sn = c2.text_input("公司名稱", "裕隆")
+
+    col_btn1, col_btn2, col_btn3 = st.columns(3)
+
+    # 按鈕一：僅財報
+    with col_btn1:
+        if st.button("📊 1. 僅更新財報", use_container_width=True):
+            with st.spinner(f"正在同步 {sn} 的財務指標 (包含年度正確加總)..."):
+                fin_data = get_financials(sc, sn, skip_ai=True)
+                if fin_data:
+                    supabase.table("underwriting_cache").upsert({
+                        "code": sc, "name": sn, "financial_data": fin_data, "updated_at": datetime.now().isoformat()
+                    }).execute()
+                    st.success(f"✅ {sn} 財務數據已成功寫入 Supabase！")
+                    with st.expander("預覽更新資料"):
+                        st.json(fin_data[:2])
+
+    # 按鈕二：僅重訊
+    with col_btn2:
+        if st.button("📰 2. 僅更新重訊", type="primary", use_container_width=True):
+            with st.spinner(f"🚀 繞過財務 API，極速單獨抓取 {sn} 的官方重訊..."):
+                only_news = fetch_mops_detailed_news(sc)
+                if only_news is not None:
+                    supabase.table("mops_news_cache").upsert({
+                        "stock_code": sc, "news_data": only_news, "updated_at": datetime.now().isoformat()
+                    }).execute()
+                    st.success(f"✅ {sn} 獨立更新完成！最新 {len(only_news)} 筆風險重訊已寫入！")
+                    with st.expander("預覽最新重訊 (前3筆)"):
+                        st.json(only_news[:3] if only_news else [{"訊息": "近三年無高風險重訊"}])
+
+    # 按鈕三：財報 + 重訊
+    with col_btn3:
+        if st.button("⚡ 3. 雙軌同步 (財報+重訊)", type="primary", use_container_width=True):
+            with st.spinner(f"正在完整同步 {sn} 的雙軌數據..."):
+                fin_data = get_financials(sc, sn, skip_ai=True)
+                only_news = fetch_mops_detailed_news(sc)
+                
+                if fin_data:
+                    supabase.table("underwriting_cache").upsert({
+                        "code": sc, "name": sn, "financial_data": fin_data, "updated_at": datetime.now().isoformat()
+                    }).execute()
+                if only_news is not None:
+                    supabase.table("mops_news_cache").upsert({
+                        "stock_code": sc, "news_data": only_news, "updated_at": datetime.now().isoformat()
+                    }).execute()
+                    
+                st.success(f"✅ {sn} 完整雙軌數據已存入中台雙表！(取得 {len(only_news) if only_news is not None else 0} 筆重訊)")
+
+
+# ----------------- Tab 2: 批次更新 -----------------
+with tab2:
+    st.markdown("### 📉 缺漏名單自動補足")
     col_a, col_b = st.columns(2)
     if col_a.button("🔄 1. 開始掃描缺漏", type="primary"):
         with st.spinner("正在安全獲取全台純實體公司名單..."):
@@ -317,126 +379,62 @@ with tab1:
                 st.error("❌ 無法取得市場名單！")
             else:
                 db_codes = get_db_codes()
-                # 🛡️ 第一層防護：掃描時就直接把已經有的公司剃除，不會出現在缺漏清單中
                 missing = market_df[~market_df['代號'].astype(str).isin(db_codes)].copy()
                 st.session_state.missing_list = missing
-                st.success(f"掃描完畢！已完美剃除權證與衍生商品。目前資料庫已有 {len(db_codes)} 家，尚缺 {len(missing)} 家。")
+                st.success(f"掃描完畢！目前資料庫已有 {len(db_codes)} 家，尚缺 {len(missing)} 家。")
 
     if 'missing_list' in st.session_state and not st.session_state.missing_list.empty:
         m_list = st.session_state.missing_list
         st.dataframe(m_list.head(100))
         batch_count = st.slider("選擇補足家數", 1, len(m_list), 10)
         
-        col_batch1, col_batch2 = st.columns(2)
+        col_b1, col_b2, col_b3 = st.columns(3)
         
-        with col_batch1:
-            if st.button(f"🚀 批次補足 (財報+重訊) - {batch_count} 家", use_container_width=True):
-                p_bar = st.progress(0)
-                st_status = st.empty()
-                success_cnt = 0
-                skip_cnt = 0
-                
-                # 執行前再次抓取現有的財報與重訊名單 (確保即時性)
-                existing_fin_codes = get_db_codes()
-                existing_news_codes = get_news_db_codes()
-                
+        with col_b1:
+            if st.button(f"📊 批次更新財報 ({batch_count}家)", use_container_width=True):
+                p_bar, st_status = st.progress(0), st.empty()
+                success_cnt, skip_cnt = 0, 0
+                existing = get_db_codes()
                 for i, row in enumerate(m_list.head(batch_count).itertuples()):
-                    # 🛡️ 第二層防護：執行迴圈時若偵測到已有資料，秒速略過
-                    if str(row.代號) in existing_fin_codes and str(row.代號) in existing_news_codes:
-                        st_status.text(f"⏭️ 略過 ({i+1}/{batch_count}): {row.代號} {row.名稱} (已有完整雙軌資料)")
-                        skip_cnt += 1
-                        p_bar.progress((i+1)/batch_count)
-                        continue
-                        
-                    st_status.text(f"⏳ 處理中 ({i+1}/{batch_count}): {row.代號} {row.名稱} (抓取財報與重訊...)")
-                    res_data = process_data(row.代號, row.名稱, skip_ai=True)
-                    if res_data:
-                        supabase.table("underwriting_cache").upsert({
-                            "code": row.代號, "name": row.名稱, "financial_data": res_data["financials"], "updated_at": datetime.now().isoformat()
-                        }).execute()
-                        supabase.table("mops_news_cache").upsert({
-                            "stock_code": row.代號, "news_data": res_data["news"], "updated_at": datetime.now().isoformat()
-                        }).execute()
+                    if str(row.代號) in existing:
+                        skip_cnt += 1; p_bar.progress((i+1)/batch_count); continue
+                    st_status.text(f"⏳ 處理財報: {row.代號} {row.名稱}")
+                    f_data = get_financials(row.代號, row.名稱, skip_ai=True)
+                    if f_data:
+                        supabase.table("underwriting_cache").upsert({"code": row.代號, "name": row.名稱, "financial_data": f_data, "updated_at": datetime.now().isoformat()}).execute()
                         success_cnt += 1
                     p_bar.progress((i+1)/batch_count)
-                st.success(f"✅ 批次作業結束！成功更新 {success_cnt} 家，智慧跳過 {skip_cnt} 家。")
+                st.success(f"✅ 成功寫入 {success_cnt} 家財報，略過 {skip_cnt} 家。")
                 
-        with col_batch2:
-            if st.button(f"📰 批次極速補足 (僅更新重訊) - {batch_count} 家", type="primary", use_container_width=True):
-                p_bar = st.progress(0)
-                st_status = st.empty()
-                success_cnt = 0
-                skip_cnt = 0
-                
-                existing_news_codes = get_news_db_codes()
-                
+        with col_b2:
+            if st.button(f"📰 批次更新重訊 ({batch_count}家)", type="primary", use_container_width=True):
+                p_bar, st_status = st.progress(0), st.empty()
+                success_cnt, skip_cnt = 0, 0
+                existing = get_news_db_codes()
                 for i, row in enumerate(m_list.head(batch_count).itertuples()):
-                    if str(row.代號) in existing_news_codes:
-                        st_status.text(f"⏭️ 略過 ({i+1}/{batch_count}): {row.代號} {row.名稱} (已有風險重訊資料)")
-                        skip_cnt += 1
-                        p_bar.progress((i+1)/batch_count)
-                        continue
-                        
-                    st_status.text(f"⏳ 處理中 ({i+1}/{batch_count}): {row.代號} {row.名稱} (專注爬取最新風險重訊...)")
-                    only_news = fetch_mops_detailed_news(row.代號)
-                    if only_news is not None:
-                        supabase.table("mops_news_cache").upsert({
-                            "stock_code": row.代號, 
-                            "news_data": only_news, 
-                            "updated_at": datetime.now().isoformat()
-                        }).execute()
+                    if str(row.代號) in existing:
+                        skip_cnt += 1; p_bar.progress((i+1)/batch_count); continue
+                    st_status.text(f"⏳ 處理重訊: {row.代號} {row.名稱}")
+                    n_data = fetch_mops_detailed_news(row.代號)
+                    if n_data is not None:
+                        supabase.table("mops_news_cache").upsert({"stock_code": row.代號, "news_data": n_data, "updated_at": datetime.now().isoformat()}).execute()
                         success_cnt += 1
                     p_bar.progress((i+1)/batch_count)
-                st.success(f"✅ 批次重訊作業結束！成功寫入 {success_cnt} 家最新風險，智慧跳過 {skip_cnt} 家。")
-
-with tab2:
-    st.markdown("### 📝 單筆數據進件與更新")
-    c1, c2 = st.columns(2)
-    sc = c1.text_input("股票代號", "2201")
-    sn = c2.text_input("公司名稱", "裕隆")
-
-    col_btn1, col_btn2, col_btn3 = st.columns(3)
-
-    with col_btn1:
-        if st.button("⚡ 快速更新 (財報+重訊)", use_container_width=True):
-            with st.spinner(f"正在同步 {sn} 的財務指標與公開重訊..."):
-                res = process_data(sc, sn, skip_ai=True)
-                if res:
-                    supabase.table("underwriting_cache").upsert({
-                        "code": sc, "name": sn, "financial_data": res["financials"], "updated_at": datetime.now().isoformat()
-                    }).execute()
-                    supabase.table("mops_news_cache").upsert({
-                        "stock_code": sc, "news_data": res["news"], "updated_at": datetime.now().isoformat()
-                    }).execute()
-                    st.success(f"✅ {sn} 財務數據與 {len(res['news'])} 筆重訊已寫入 Supabase！")
-                    with st.expander("預覽更新資料"):
-                        st.json(res["financials"][:2])
-
-    with col_btn2:
-        if st.button("🔍 深度更新 (含 AI)", type="primary", use_container_width=True):
-            with st.spinner("正在進行完整核保調查 (含網路搜尋與所有重訊)..."):
-                res = process_data(sc, sn, skip_ai=False)
-                if res:
-                    supabase.table("underwriting_cache").upsert({
-                        "code": sc, "name": sn, "financial_data": res["financials"], "updated_at": datetime.now().isoformat()
-                    }).execute()
-                    supabase.table("mops_news_cache").upsert({
-                        "stock_code": sc, "news_data": res["news"], "updated_at": datetime.now().isoformat()
-                    }).execute()
-                    st.success(f"✅ {sn} 完整調查與重訊已存入中台雙表！")
-
-    with col_btn3:
-        if st.button("📰 僅強制更新重訊", use_container_width=True):
-            with st.spinner(f"🚀 繞過財務 API，極速單獨抓取 {sn} 的官方重訊..."):
-                only_news = fetch_mops_detailed_news(sc)
+                st.success(f"✅ 成功寫入 {success_cnt} 家最新風險重訊，略過 {skip_cnt} 家。")
                 
-                if only_news is not None:
-                    supabase.table("mops_news_cache").upsert({
-                        "stock_code": sc, 
-                        "news_data": only_news, 
-                        "updated_at": datetime.now().isoformat()
-                    }).execute()
-                    
-                    st.success(f"✅ 獨立更新完成！{sn} 的最新 {len(only_news)} 筆重訊已寫入！")
-                    with st.expander("預覽最新重訊 (前3筆)"):
-                        st.json(only_news[:3] if only_news else [{"訊息": "近三年無重訊"}])
+        with col_b3:
+            if st.button(f"⚡ 批次雙軌同步 ({batch_count}家)", type="primary", use_container_width=True):
+                p_bar, st_status = st.progress(0), st.empty()
+                success_cnt, skip_cnt = 0, 0
+                e_fin, e_news = get_db_codes(), get_news_db_codes()
+                for i, row in enumerate(m_list.head(batch_count).itertuples()):
+                    if str(row.代號) in e_fin and str(row.代號) in e_news:
+                        skip_cnt += 1; p_bar.progress((i+1)/batch_count); continue
+                    st_status.text(f"⏳ 雙軌同步中: {row.代號} {row.名稱}")
+                    f_data = get_financials(row.代號, row.名稱, skip_ai=True)
+                    n_data = fetch_mops_detailed_news(row.代號)
+                    if f_data: supabase.table("underwriting_cache").upsert({"code": row.代號, "name": row.名稱, "financial_data": f_data, "updated_at": datetime.now().isoformat()}).execute()
+                    if n_data is not None: supabase.table("mops_news_cache").upsert({"stock_code": row.代號, "news_data": n_data, "updated_at": datetime.now().isoformat()}).execute()
+                    success_cnt += 1
+                    p_bar.progress((i+1)/batch_count)
+                st.success(f"✅ 成功雙軌同步 {success_cnt} 家，略過 {skip_cnt} 家。")
