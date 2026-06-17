@@ -44,6 +44,7 @@ async def analyze(request: Request):
             }, status_code=200)
 
         record = res.data[0]
+        actual_stock_code = str(record.get('code')) # 確保拿到正確的股票代號，用來跨表查重訊
         raw_rows = record.get('financial_data', [])
         
         if not raw_rows: 
@@ -153,6 +154,46 @@ async def analyze(request: Request):
             final_markdown += stock_markdown
 
         # ==========================================
+        # 🏆 核心功能：CMCR 財務信評分析
+        # ==========================================
+        cmcr_row = next((r for r in raw_rows if r.get("項目") == "CMCR評等"), None)
+        cmcr_rating = cmcr_row.get(display_quarters[0], "依系統規則試算中") if cmcr_row and display_quarters else "依系統規則試算中"
+        final_markdown += f"\n\n### 五、CMCR 財務信評分析\n* **當前信評等級**：{cmcr_rating}\n* **數據來源**：優先採用 CMoney 財務平台數據\n"
+
+        # ==========================================
+        # 🚨 全新功能：跨表抓取高風險重訊 (mops_news_cache)
+        # ==========================================
+        news_markdown = "\n\n### 六、近期重大負面與風險重訊 (AI 智能過濾)\n"
+        try:
+            # 去重訊專屬表抓取該公司的資料
+            news_res = supabase.table("mops_news_cache").select("news_data").eq("stock_code", actual_stock_code).execute()
+            
+            if news_res and news_res.data:
+                news_list = news_res.data[0].get("news_data", [])
+                
+                if news_list and len(news_list) > 0:
+                    # 為了避免內容過長塞爆 AI token，我們取最新的前 5 筆重訊
+                    for idx, news in enumerate(news_list[:5]):
+                        news_date = news.get("日期", "未知日期")
+                        news_subject = news.get("主旨", "無主旨").replace('\n', '')
+                        # 簡化內文以防過長
+                        news_content = str(news.get("內文", ""))[:150] + "..." 
+                        
+                        news_markdown += f"**{idx+1}. [{news_date}] {news_subject}**\n> 摘要：{news_content}\n\n"
+                    
+                    if len(news_list) > 5:
+                        news_markdown += f"*(註：系統另有 {len(news_list)-5} 筆早期風險紀錄，已省略顯示)*\n"
+                else:
+                    news_markdown += "✅ 近三年內無觸發高風險關鍵字 (如訴訟、掏空等) 之重大訊息。\n"
+            else:
+                news_markdown += "✅ 中台暫無該公司風險重訊紀錄。\n"
+        except Exception as e:
+            news_markdown += f"⚠️ 重訊資料庫連線或讀取失敗: {e}\n"
+
+        # 把重訊加到最下方
+        final_markdown += news_markdown
+
+        # ==========================================
         # ⚖️ 核保判定邏輯 (Group A check)
         # ==========================================
         conclusion = "⚠️ 無法判定"
@@ -163,9 +204,10 @@ async def analyze(request: Request):
                 val = float(val_str)
                 
                 if val > 15000000:
-                    conclusion = "⚠️ **本案不符合 Group A** (營收 > 150億，屬大型企業)"
+                    # 強制使用中文大於小於，防止 Copilot Studio 發生字元解析報錯
+                    conclusion = "⚠️ **本案不符合 Group A** (營收 大於 150億，屬大型企業)"
                 else:
-                    conclusion = "✅ **符合 Group A** (營收 < 150億)"
+                    conclusion = "✅ **符合 Group A** (營收 小於 150億)"
         except: pass
 
         return {
