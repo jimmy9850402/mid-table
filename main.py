@@ -44,7 +44,7 @@ async def analyze(request: Request):
             }, status_code=200)
 
         record = res.data[0]
-        actual_stock_code = str(record.get('code')) # 確保拿到正確的股票代號，用來跨表查重訊
+        actual_stock_code = str(record.get('code'))
         raw_rows = record.get('financial_data', [])
         
         if not raw_rows: 
@@ -53,12 +53,9 @@ async def analyze(request: Request):
         # ==========================================
         # 🔥 核心邏輯：過濾空季度 (Smart Filter)
         # ==========================================
-        
-        # 1. 取得所有含 Q 的季度 Key
         all_keys = [k for k in raw_rows[0].keys() if k != "項目"]
         all_quarters = sorted([k for k in all_keys if "Q" in k], reverse=True)
         
-        # 2. 【過濾邏輯】找出「營業收入」不是空值的季度
         rev_row = next((r for r in raw_rows if "營業收入" in r["項目"]), None)
         
         valid_quarters = []
@@ -70,19 +67,32 @@ async def analyze(request: Request):
         else:
             valid_quarters = all_quarters
 
-        # 3. 只取「有效季度」的前 5 個
         display_quarters = valid_quarters[:5]
         
-        # 4. 處理年度 (Years) - 指定 2023(112) 與 2024(113)
-        target_years_roc = [112, 113]
-        display_years_labels = ["2023年", "2024年"]
+        # ==========================================
+        # 🌟 升級功能：動態抓取最新年度，解除時間鎖定
+        # ==========================================
+        all_roc_years = set()
+        for k in all_keys:
+            if "年" in k and "Q" not in k:
+                num_str = "".join(filter(str.isdigit, k))
+                if num_str:
+                    all_roc_years.add(int(num_str))
+                    
+        if all_roc_years:
+            target_years_roc = sorted(list(all_roc_years))[-3:] # 永遠抓最新的三年
+        else:
+            target_years_roc = [113, 114, 115] # 萬一沒抓到，給予預設值
+
+        # 直接在表頭寫清楚西元與民國年，例如 "2026年(115)"
+        display_years_labels = [f"{yr+1911}年({yr})" for yr in target_years_roc]
         
         def get_year_val(roc_year, row):
             key_full = f"{roc_year}年"
             key_q4 = f"{roc_year}年 Q4"
             if key_full in row and str(row[key_full]) not in ["-", "None", "0"]:
                 return str(row[key_full])
-            elif key_q4 in row:
+            elif key_q4 in row and str(row[key_q4]) not in ["-", "None"]:
                 return str(row[key_q4]) + " (Q4)"
             else:
                 return "-"
@@ -122,61 +132,49 @@ async def analyze(request: Request):
         final_markdown = f"{header_str}\n{sep_str}\n" + "\n".join(md_rows)
         
         # ==========================================
-        # 🌟 新增邏輯：抓取並組合「股價波動資訊」Markdown
+        # 抓取並組合「股價波動資訊」Markdown
         # ==========================================
         stock_row = next((r for r in raw_rows if r.get("項目") == "近三年股價與大盤"), None)
         if stock_row and "股價分析數據" in stock_row:
             stock_data = stock_row["股價分析數據"]
-            
-            # 建立股價表格的 Markdown
             vol_header = "\n\n### 四、股價波動資訊與大盤比較\n| 年度 | 高點 | 低點 | 走勢評估 |\n| :--- | :--- | :--- | :--- |\n"
             vol_rows = []
-            divergence_summaries = [] # 收集背離說明
+            divergence_summaries = []
             
             for item in stock_data:
-                # 組合表格的每一列
                 vol_rows.append(f"| {item['年度']} | {item['高點']} | {item['低點']} | {item['走勢評估']} |")
-                
-                # 若有背離，準備寫入摘要說明
                 if "背離" in item['走勢評估']:
                     divergence_summaries.append(f"({item['年度']}) 走勢{item['走勢評估']}。")
             
-            # 組合最終的股價 Markdown 區塊
             stock_markdown = vol_header + "\n".join(vol_rows)
-            
-            # 加上摘要文字
             if divergence_summaries:
                 stock_markdown += f"\n\n波動摘要說明：發現明顯背離。請核保人員留意以下年度：" + " ".join(divergence_summaries)
             else:
                 stock_markdown += "\n\n波動摘要說明：近三年走勢與大盤大致相符。"
                 
-            # 將股價區塊拼接到原本的 final_markdown 後面
             final_markdown += stock_markdown
 
         # ==========================================
-        # 🏆 核心功能：CMCR 財務信評分析
+        # 🏆 核心功能：CMCR 財務信評分析 (保留優先權)
         # ==========================================
         cmcr_row = next((r for r in raw_rows if r.get("項目") == "CMCR評等"), None)
         cmcr_rating = cmcr_row.get(display_quarters[0], "依系統規則試算中") if cmcr_row and display_quarters else "依系統規則試算中"
         final_markdown += f"\n\n### 五、CMCR 財務信評分析\n* **當前信評等級**：{cmcr_rating}\n* **數據來源**：優先採用 CMoney 財務平台數據\n"
 
         # ==========================================
-        # 🚨 全新功能：跨表抓取高風險重訊 (mops_news_cache)
+        # 🚨 跨表抓取高風險重訊 (mops_news_cache)
         # ==========================================
         news_markdown = "\n\n### 六、近期重大負面與風險重訊 (AI 智能過濾)\n"
         try:
-            # 去重訊專屬表抓取該公司的資料
             news_res = supabase.table("mops_news_cache").select("news_data").eq("stock_code", actual_stock_code).execute()
             
             if news_res and news_res.data:
                 news_list = news_res.data[0].get("news_data", [])
                 
                 if news_list and len(news_list) > 0:
-                    # 為了避免內容過長塞爆 AI token，我們取最新的前 5 筆重訊
                     for idx, news in enumerate(news_list[:5]):
                         news_date = news.get("日期", "未知日期")
                         news_subject = news.get("主旨", "無主旨").replace('\n', '')
-                        # 簡化內文以防過長
                         news_content = str(news.get("內文", ""))[:150] + "..." 
                         
                         news_markdown += f"**{idx+1}. [{news_date}] {news_subject}**\n> 摘要：{news_content}\n\n"
@@ -190,7 +188,6 @@ async def analyze(request: Request):
         except Exception as e:
             news_markdown += f"⚠️ 重訊資料庫連線或讀取失敗: {e}\n"
 
-        # 把重訊加到最下方
         final_markdown += news_markdown
 
         # ==========================================
@@ -204,7 +201,6 @@ async def analyze(request: Request):
                 val = float(val_str)
                 
                 if val > 15000000:
-                    # 強制使用中文大於小於，防止 Copilot Studio 發生字元解析報錯
                     conclusion = "⚠️ **本案不符合 Group A** (營收 大於 150億，屬大型企業)"
                 else:
                     conclusion = "✅ **符合 Group A** (營收 小於 150億)"
